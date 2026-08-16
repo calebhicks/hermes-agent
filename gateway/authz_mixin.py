@@ -438,6 +438,28 @@ class GatewayAuthorizationMixin:
         ):
             return True
 
+        # External resource authorization is an adapter-owned edge check. It
+        # runs before ordinary allowlists so a local allowlist cannot bypass a
+        # configured remote membership policy. The check reads only a local
+        # marker carried on this in-process SessionSource; that marker is not
+        # serialized by SessionSource.to_dict()/from_dict().
+        adapter = self._authorization_adapter(source.platform, adapter_profile)
+        if adapter is not None:
+            try:
+                required = getattr(
+                    adapter, "external_resource_authorization_required", None
+                )
+                authorized = getattr(adapter, "external_resource_authorized", None)
+                if (
+                    callable(required)
+                    and required()
+                    and callable(authorized)
+                    and not authorized(source)
+                ):
+                    return False
+            except Exception:
+                return False
+
         user_id = source.user_id
 
         # Telegram (and similar) authorize entire group/forum/channel chats

@@ -2959,6 +2959,14 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    def external_resource_authorization_required(self) -> bool:
+        """Whether this adapter requires a remote resource-membership check."""
+        return False
+
+    def external_resource_authorized(self, source: Any) -> bool:
+        """Return the local, non-wire authorization result for ``source``."""
+        return True
+
     def prefers_fresh_final_streaming(
         self,
         content: str,

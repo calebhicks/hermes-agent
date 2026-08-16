@@ -249,8 +249,8 @@ class TestClarifyLogPrivacy:
         with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
             with patch.object(
                 adapter,
-                "_is_interactive_user_authorized",
-                return_value=True,
+                "_authorize_interactive_user",
+                new=AsyncMock(return_value=True),
             ):
                 await adapter._handle_clarify_action(AsyncMock(), body, action)
 

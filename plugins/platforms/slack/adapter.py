@@ -17,6 +17,7 @@ import os
 import re
 import time
 import unicodedata
+from urllib.parse import urlencode, urlparse
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
@@ -77,6 +78,7 @@ except Exception:
 _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+_EXTERNAL_RESOURCE_RESPONSE_LIMIT_BYTES = 8 * 1024
 
 
 async def _read_error_text_limited(
@@ -912,6 +914,9 @@ class SlackAdapter(BasePlatformAdapter):
         # the name cache. Used to catch peer-agent posts that arrive as plain
         # user messages without bot_id/subtype=bot_message markers.
         self._user_is_bot_cache: Dict[Tuple[str, str], bool] = {}
+        self._external_resource_cache: Dict[Tuple[str, str], float] = {}
+        self._EXTERNAL_RESOURCE_CACHE_TTL = 15.0
+        self._EXTERNAL_RESOURCE_CACHE_MAX = 1024
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
@@ -2127,6 +2132,29 @@ class SlackAdapter(BasePlatformAdapter):
             # them at dispatch time.
             def _make_wrapper(cb, plugin_name):
                 async def _wrapped(ack, body, action):
+                    body = body or {}
+                    user = body.get("user") or {}
+                    channel = body.get("channel") or {}
+                    user_id = str(user.get("id") or "").strip()
+                    channel_id = str(channel.get("id") or body.get("channel_id") or "")
+                    user_name = user.get("name") or user.get("username")
+                    team_id = self._event_team_id({}, body)
+                    if not await self._authorize_interactive_user(
+                        user_id,
+                        channel_id=channel_id,
+                        user_name=user_name,
+                        team_id=team_id,
+                    ):
+                        logger.warning(
+                            "[Slack] Unauthorized plugin action click by %s (%s) - ignoring",
+                            user_name or "unknown",
+                            user_id,
+                        )
+                        try:
+                            await ack()
+                        except Exception:
+                            pass
+                        return
                     try:
                         await cb(ack, body, action)
                     except Exception as exc:  # pragma: no cover - defensive
@@ -3778,6 +3806,206 @@ class SlackAdapter(BasePlatformAdapter):
             await self._add_reaction(channel_id, ts, "x", team_id)
 
     # ----- User identity resolution -----
+
+    def _external_resource_configured(self) -> bool:
+        value = (self.config.extra or {}).get("external_resource_authz")
+        return isinstance(value, dict) and value.get("enabled", True) is not False
+
+    def _external_resource_config(self) -> Optional[dict]:
+        value = (self.config.extra or {}).get("external_resource_authz")
+        if not isinstance(value, dict) or value.get("enabled", True) is False:
+            return None
+        return value
+
+    def external_resource_authorization_required(self) -> bool:
+        return self._external_resource_configured()
+
+    def external_resource_authorized(self, source: Any) -> bool:
+        """Read only the local marker set by the async Slack edge check."""
+        if not self.external_resource_authorization_required():
+            return True
+        return getattr(source, "external_resource_authorized", False) is True
+
+    @staticmethod
+    def _slack_response_data(response: Any) -> dict:
+        if isinstance(response, dict):
+            return response
+        data = getattr(response, "data", None)
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    async def _read_json_response_limited(response: Any) -> Any:
+        content = getattr(response, "content", None)
+        read = getattr(content, "read", None)
+        if not callable(read):
+            text_fn = getattr(response, "text", None)
+            if not callable(text_fn):
+                return None
+            text = str(await text_fn())[:_EXTERNAL_RESOURCE_RESPONSE_LIMIT_BYTES]
+            return json.loads(text)
+
+        chunks: list[bytes] = []
+        total = 0
+        limit = _EXTERNAL_RESOURCE_RESPONSE_LIMIT_BYTES
+        while total <= limit:
+            chunk = await read(min(4096, limit + 1 - total))
+            if not chunk:
+                break
+            data = bytes(chunk)
+            chunks.append(data)
+            total += len(data)
+        if total > limit:
+            release = getattr(response, "release", None)
+            if callable(release):
+                release()
+            return None
+        return json.loads(b"".join(chunks).decode("utf-8"))
+
+    @staticmethod
+    def _external_membership_payload_authorizes(payload: Any, email: str) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        def _normalize(value: Any) -> str:
+            return str(value or "").strip().lower()
+
+        def _identity_values(obj: Any) -> set[str]:
+            values: set[str] = set()
+            if not isinstance(obj, dict):
+                return values
+            for key in ("email", "principal", "principal_email", "user_email"):
+                value = obj.get(key)
+                if isinstance(value, str) and "@" in value:
+                    values.add(_normalize(value))
+            identity = obj.get("identity")
+            if isinstance(identity, dict):
+                values.update(_identity_values(identity))
+            elif isinstance(identity, str) and "@" in identity:
+                values.add(_normalize(identity))
+            user = obj.get("user")
+            if isinstance(user, dict):
+                values.update(_identity_values(user))
+            return values
+
+        member = payload.get("member")
+        if member is None:
+            return False
+        if not isinstance(member, dict):
+            return False
+        identities = _identity_values(member)
+        return identities == {email} and member.get("role") == "member"
+
+    def _external_resource_url(self, endpoint: str, resource: str, email: str) -> str:
+        parsed = urlparse(endpoint)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+        ):
+            return ""
+        query = urlencode({"slug": resource, "email": email})
+        separator = "&" if parsed.query else "?"
+        return f"{endpoint}{separator}{query}"
+
+    async def _authorize_external_resource(
+        self,
+        user_id: str,
+        *,
+        chat_id: str,
+        team_id: str,
+        source: Any,
+    ) -> bool:
+        config = self._external_resource_config()
+        if config is None:
+            return True
+
+        resource = str(config.get("resource") or "").strip()
+        endpoint = str(config.get("endpoint") or "").strip()
+        token_name = str(config.get("token_secret") or "").strip()
+        normalized_user_id = str(user_id or "").strip()
+        if not resource or not endpoint or not token_name or not normalized_user_id:
+            return False
+
+        try:
+            token = str(get_secret(token_name) or "").strip()
+            if not token:
+                return False
+
+            client = (
+                self._get_client(chat_id, team_id=team_id or None)
+                if chat_id
+                else self._app.client
+            )
+            result = self._slack_response_data(
+                await client.users_info(user=normalized_user_id)
+            )
+            user = result.get("user") if isinstance(result, dict) else None
+            profile = user.get("profile") if isinstance(user, dict) else None
+            email = profile.get("email") if isinstance(profile, dict) else None
+            if (
+                not isinstance(email, str)
+                or not email.strip()
+                or profile.get("email_verified") is not True
+            ):
+                return False
+            email = email.strip().lower()
+
+            key = (resource, email)
+            now = time.monotonic()
+            expiry = self._external_resource_cache.get(key)
+            if expiry is not None:
+                if expiry > now:
+                    source.external_resource_authorized = True
+                    return True
+                self._external_resource_cache.pop(key, None)
+
+            url = self._external_resource_url(endpoint, resource, email)
+            if not url:
+                return False
+
+            try:
+                cache_ttl = min(
+                    float(config.get("cache_ttl", self._EXTERNAL_RESOURCE_CACHE_TTL)),
+                    self._EXTERNAL_RESOURCE_CACHE_TTL,
+                )
+            except (TypeError, ValueError):
+                return False
+            if cache_ttl <= 0:
+                return False
+
+            timeout = aiohttp.ClientTimeout(total=3.0)
+            headers = {"Authorization": f"Bearer {token}"}
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    allow_redirects=False,
+                ) as response:
+                    if response.status != 200:
+                        return False
+                    payload = await self._read_json_response_limited(response)
+
+            if not self._external_membership_payload_authorizes(payload, email):
+                return False
+
+            self._external_resource_cache[key] = now + cache_ttl
+            if len(self._external_resource_cache) > self._EXTERNAL_RESOURCE_CACHE_MAX:
+                excess = (
+                    len(self._external_resource_cache)
+                    - self._EXTERNAL_RESOURCE_CACHE_MAX // 2
+                )
+                for old_key in sorted(
+                    self._external_resource_cache,
+                    key=self._external_resource_cache.get,
+                )[:excess]:
+                    self._external_resource_cache.pop(old_key, None)
+            source.external_resource_authorized = True
+            return True
+        except Exception:
+            logger.warning("[Slack] external resource authorization failed", exc_info=True)
+            return False
 
     async def _resolve_user_name(
         self, user_id: str, chat_id: str = "", team_id: str = ""
@@ -5522,6 +5750,7 @@ class SlackAdapter(BasePlatformAdapter):
         # the same auth chain up front.
         _runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         _auth_fn = getattr(_runner, "_is_user_authorized", None)
+        _external_resource_authorized = False
         if user_id and callable(_auth_fn):
             _source = self.build_source(
                 chat_id=channel_id,
@@ -5529,7 +5758,19 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_type="dm" if is_dm else "group",
                 user_id=user_id,
                 user_name="",
+                scope_id=str(team_id) if team_id else None,
             )
+            if not await self._authorize_external_resource(
+                str(user_id or ""),
+                chat_id=str(channel_id or ""),
+                team_id=str(team_id or ""),
+                source=_source,
+            ):
+                logger.warning(
+                    "[Slack] Early reject of user %s by external resource authorization",
+                    user_id,
+                )
+                return
             if not _auth_fn(_source):
                 logger.warning(
                     "[Slack] Early reject of unauthorized user %s in channel %s",
@@ -5537,6 +5778,7 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id,
                 )
                 return
+            _external_resource_authorized = _source.external_resource_authorized
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -6215,6 +6457,7 @@ class SlackAdapter(BasePlatformAdapter):
             # (they carry no user_id to match against the allowlist).
             is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
         )
+        source.external_resource_authorized = _external_resource_authorized
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (
@@ -6644,8 +6887,9 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id: str = "",
         user_name: Optional[str] = None,
         team_id: str = "",
+        source: Any = None,
     ) -> bool:
-        """Return whether a Slack interactive caller may perform gated actions."""
+        """Check the ordinary synchronous Slack/gateway authorization policy."""
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
@@ -6656,7 +6900,7 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 from gateway.session import SessionSource
 
-                source = SessionSource(
+                auth_source = source or SessionSource(
                     platform=Platform.SLACK,
                     chat_id=str(channel_id or normalized_user_id),
                     chat_type="dm" if str(channel_id or "").startswith("D") else "group",
@@ -6664,13 +6908,10 @@ class SlackAdapter(BasePlatformAdapter):
                     user_name=str(user_name).strip() if user_name else None,
                     scope_id=str(team_id) if team_id else None,
                 )
-                return bool(auth_fn(source))
+                return bool(auth_fn(auth_source))
             except Exception:
-                logger.debug(
-                    "[Slack] Falling back to env-only interactive auth for user %s",
-                    normalized_user_id,
-                    exc_info=True,
-                )
+                logger.debug("[Slack] Gateway interactive auth failed", exc_info=True)
+                return False
 
         if os.getenv("SLACK_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
             return True
@@ -6702,6 +6943,44 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         return _env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
+    async def _authorize_interactive_user(
+        self,
+        user_id: str,
+        *,
+        channel_id: str = "",
+        user_name: Optional[str] = None,
+        team_id: str = "",
+    ) -> bool:
+        """Return whether a Slack interactive caller may perform gated actions."""
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return False
+
+        from gateway.session import SessionSource
+
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id=str(channel_id or normalized_user_id),
+            chat_type="dm" if str(channel_id or "").startswith("D") else "group",
+            user_id=normalized_user_id,
+            user_name=str(user_name).strip() if user_name else None,
+            scope_id=str(team_id) if team_id else None,
+        )
+        if not await self._authorize_external_resource(
+            normalized_user_id,
+            chat_id=str(channel_id or normalized_user_id),
+            team_id=str(team_id or ""),
+            source=source,
+        ):
+            return False
+        return self._is_interactive_user_authorized(
+            normalized_user_id,
+            channel_id=channel_id,
+            user_name=user_name,
+            team_id=team_id,
+            source=source,
+        )
+
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""
         await ack()
@@ -6714,7 +6993,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
-        if not self._is_interactive_user_authorized(
+        if not await self._authorize_interactive_user(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
@@ -6837,6 +7116,14 @@ class SlackAdapter(BasePlatformAdapter):
         message = body.get("message", {}) or {}
         channel_id = (body.get("channel") or {}).get("id", "")
         user_id = (body.get("user") or {}).get("id", "")
+        team_id = self._event_team_id({}, body)
+        if not await self._authorize_interactive_user(
+            user_id,
+            channel_id=channel_id,
+            team_id=team_id,
+        ):
+            logger.warning("[Slack] Unauthorized feedback click by %s - ignoring", user_id)
+            return
         logger.info(
             "[Slack] Feedback button clicked: value=%s user=%s channel=%s ts=%s",
             value,
@@ -6858,7 +7145,7 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
+        if not await self._authorize_interactive_user(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
@@ -7017,11 +7304,13 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+        team_id = self._event_team_id({}, body)
 
-        if not self._is_interactive_user_authorized(
+        if not await self._authorize_interactive_user(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
+            team_id=team_id,
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
@@ -7728,6 +8017,14 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             scope_id=team_id or None,
         )
+        if not await self._authorize_external_resource(
+            str(user_id or ""),
+            chat_id=str(channel_id or ""),
+            team_id=str(team_id or ""),
+            source=source,
+        ):
+            logger.warning("[Slack] Unauthorized slash command by %s - ignoring", user_id)
+            return
 
         event = MessageEvent(
             text=text,
