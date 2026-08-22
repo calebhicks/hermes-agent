@@ -279,6 +279,8 @@ def _normalise(setting: str, value: Any) -> Any:
             val = value.strip().lower()
             if val == "generic" and setting == "long_running_notifications":
                 return "generic"
+            if val == "dynamic" and setting == "long_running_notifications":
+                return "dynamic"
             return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
     if setting == "cleanup_progress":
