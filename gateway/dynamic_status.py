@@ -185,8 +185,6 @@ def _classify_phase(activity: Mapping[str, Any] | None) -> str | None:
         return "verifying"
     if current_tool & _IMPLEMENT_TOOLS:
         return "implementing"
-    if "terminal" in current_tool and not desc:
-        return "implementing"
     if "terminal" in current_tool:
         return "implementing"
     if current_tool & _RESEARCH_TOOLS:
