@@ -28291,8 +28291,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default: bool = False,
             require_platform_override_for: set[Any] | None = None,
             allow_generic: bool = False,
+            allow_dynamic: bool = False,
         ) -> str:
-            """Return off|raw|generic for a gateway visibility surface."""
+            """Return off|raw|generic|dynamic for a gateway visibility surface."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {
@@ -28307,6 +28308,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() == "dynamic":
+                return "dynamic" if allow_dynamic else "off"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -28918,10 +28921,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "long_running_notifications",
             default=True,
             allow_generic=True,
+            allow_dynamic=True,
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
+        _dynamic_heartbeat_policy = None
+        _build_dynamic_long_running_status = None
+        if _long_running_mode == "dynamic":
+            try:
+                from gateway.dynamic_status import (
+                    DynamicHeartbeatPolicy,
+                    build_dynamic_long_running_status,
+                )
+
+                _dynamic_heartbeat_policy = DynamicHeartbeatPolicy()
+                _build_dynamic_long_running_status = build_dynamic_long_running_status
+            except Exception as _dyn_err:
+                logger.debug("Dynamic heartbeat setup failed: %s", _dyn_err)
+                _NOTIFY_INTERVAL = None
 
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
@@ -28951,12 +28969,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key, agent_holder[0], _exec_ref
                 ):
                     break
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
+                _elapsed_seconds = time.time() - _notify_start
+                _elapsed_mins = int(_elapsed_seconds // 60)
                 # Include agent activity context if available. Default
                 # heartbeat is terse: elapsed + current tool. Verbose
                 # iteration counter is gated on busy_ack_detail so users
                 # who want it can opt in per platform.
                 _agent_ref = agent_holder[0]
+                _activity_summary = None
                 _status_detail = ""
                 _want_iteration_detail = bool(
                     resolve_display_setting(
@@ -28968,7 +28988,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
+                        _activity_summary = _agent_ref.get_activity_summary()
+                        _a = _activity_summary
                         _parts = []
                         if _want_iteration_detail:
                             _parts.append(
@@ -28981,13 +29002,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-                )
+                _dynamic_status = None
+                if (
+                    _long_running_mode == "dynamic"
+                    and _dynamic_heartbeat_policy is not None
+                    and _build_dynamic_long_running_status is not None
+                ):
+                    try:
+                        _dynamic_status = _build_dynamic_long_running_status(
+                            _activity_summary,
+                            elapsed_seconds=_elapsed_seconds,
+                        )
+                    except Exception as _dyn_err:
+                        logger.debug("Dynamic heartbeat render failed: %s", _dyn_err)
+                        _dynamic_status = None
+                    if not _dynamic_heartbeat_policy.should_deliver(
+                        _dynamic_status,
+                        has_edit_target=bool(_heartbeat_msg_id),
+                    ):
+                        continue
+                    _heartbeat_text = _dynamic_status.text
+                else:
+                    _heartbeat_text = (
+                        _generic_status_phrase("status")
+                        if _long_running_mode == "generic"
+                        else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                    )
                 try:
                     _notify_res = None
+                    _sent_new_bubble = False
                     if _heartbeat_msg_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
@@ -28999,6 +29042,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
                     if not (_notify_res and getattr(_notify_res, "success", False)):
+                        if (
+                            _long_running_mode == "dynamic"
+                            and _dynamic_heartbeat_policy is not None
+                            and not _dynamic_heartbeat_policy.should_deliver(
+                                _dynamic_status,
+                                has_edit_target=False,
+                            )
+                        ):
+                            continue
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
@@ -29007,9 +29059,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
                         ):
+                            _sent_new_bubble = True
                             _heartbeat_msg_id = str(_notify_res.message_id)
                             if _cleanup_progress:
                                 _cleanup_msg_ids.append(_heartbeat_msg_id)
+                    if (
+                        _long_running_mode == "dynamic"
+                        and _dynamic_status is not None
+                        and _dynamic_heartbeat_policy is not None
+                        and getattr(_notify_res, "success", False)
+                    ):
+                        _dynamic_heartbeat_policy.record_delivery(
+                            _dynamic_status,
+                            sent_new_bubble=_sent_new_bubble,
+                        )
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
