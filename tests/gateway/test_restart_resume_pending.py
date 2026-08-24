@@ -314,6 +314,10 @@ class TestResumePendingSystemNote:
         assert "skip any unfinished work" not in note
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
+        assert "durable conversation history as the work checkpoint" in note
+        assert "steps whose results are proven" in note
+        assert "external effects that remain uncertain" in note
+        assert "inspect current state" in note
 
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
