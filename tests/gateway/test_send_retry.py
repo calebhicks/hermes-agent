@@ -9,7 +9,7 @@ Verifies that:
 - SendResult.retryable flag is respected
 """
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from gateway.platforms.base import BasePlatformAdapter, SendResult, _RETRYABLE_ERROR_PATTERNS
 from gateway.platforms.base import Platform, PlatformConfig
@@ -122,6 +122,57 @@ class TestSendWithRetryNetworkRetry:
         mock_sleep.assert_not_called()
         assert not result.success
         assert len(adapter._send_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_mutation_uncertain_never_retries_or_falls_back(self):
+        adapter = _StubAdapter()
+        adapter.platform = Mock(value="imessage")
+        uncertain = SendResult(
+            success=False,
+            error="Native outcome is uncertain; do not retry.",
+            raw_response={"delivery": "mutation_uncertain"},
+        )
+        adapter._send_results = [uncertain]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry(
+                "chat1", "hello", max_retries=3, base_delay=0
+            )
+        mock_sleep.assert_not_called()
+        assert result is uncertain
+        assert len(adapter._send_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_network_retry_stops_if_result_becomes_mutation_uncertain(self):
+        adapter = _StubAdapter()
+        adapter.platform = Mock(value="imessage")
+        uncertain = SendResult(
+            success=False,
+            error="Native outcome is uncertain; do not retry.",
+            raw_response={"delivery": "mutation_uncertain"},
+        )
+        adapter._send_results = [
+            SendResult(success=False, error="connection refused", retryable=True),
+            uncertain,
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry(
+                "chat1", "hello", max_retries=3, base_delay=0
+            )
+        assert result is uncertain
+        assert len(adapter._send_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_other_provider_cannot_spoof_imessage_terminal_sentinel(self):
+        adapter = _StubAdapter()
+        spoofed = SendResult(
+            success=False,
+            error="provider formatting error",
+            raw_response={"delivery": "mutation_uncertain"},
+        )
+        adapter._send_results = [spoofed, SendResult(success=True)]
+        result = await adapter._send_with_retry("chat1", "hello")
+        assert result.success
+        assert len(adapter._send_calls) == 2
 
 
 # ---------------------------------------------------------------------------

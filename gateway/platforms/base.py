@@ -5473,6 +5473,20 @@ class BasePlatformAdapter(ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
+    def _is_mutation_uncertain(self, result: "SendResult") -> bool:
+        """Return whether a provider may already have applied a mutation.
+
+        This is a cross-layer terminal contract: another send attempt can
+        duplicate or target a different message, regardless of whether the
+        provider's human-readable error resembles a timeout.
+        """
+        response = result.raw_response
+        return bool(
+            self.platform.value == "imessage"
+            and isinstance(response, dict)
+            and response.get("delivery") == "mutation_uncertain"
+        )
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
@@ -5551,6 +5565,11 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # An adapter that may already have mutated its provider owns the
+        # uncertainty boundary. Never retry, reformat, or send a notice
+        # through that same adapter.
+        if self._is_mutation_uncertain(result):
+            return result
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -5583,6 +5602,8 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    return result
+                if self._is_mutation_uncertain(result):
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
