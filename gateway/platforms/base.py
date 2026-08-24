@@ -3111,6 +3111,20 @@ class BasePlatformAdapter(ABC):
         lowered = (error or "").lower()
         return any(pat in lowered for pat in ("timed out", "readtimeout", "writetimeout"))
 
+    def _is_mutation_uncertain(self, result: "SendResult") -> bool:
+        """Return whether a provider may already have applied a mutation.
+
+        This is a cross-layer terminal contract: another send attempt can
+        duplicate or target a different message, regardless of whether the
+        provider's human-readable error resembles a timeout.
+        """
+        response = result.raw_response
+        return bool(
+            self.platform.value == "imessage"
+            and isinstance(response, dict)
+            and response.get("delivery") == "mutation_uncertain"
+        )
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a str/None/:class:`EphemeralReply` response into ``(text, ttl)``. ``ttl > 0``
         means schedule ``_schedule_ephemeral_delete`` after a successful send; forced to 0 when the
@@ -3168,6 +3182,11 @@ class BasePlatformAdapter(ABC):
         result = await _send(content)
         if result.success:
             return result
+        # An adapter that may already have mutated its provider owns the
+        # uncertainty boundary. Never retry, reformat, or send a notice
+        # through that same adapter.
+        if self._is_mutation_uncertain(result):
+            return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
         # (honoring the server's retry_after when present) rather than fall
@@ -3210,6 +3229,8 @@ class BasePlatformAdapter(ABC):
                 result = await _send(content)
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    return result
+                if self._is_mutation_uncertain(result):
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
