@@ -394,7 +394,8 @@ class GatewayNotificationsMixin:
                 MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
-            result = await adapter.send(source.chat_id, text_content, metadata=metadata)
+            result = await adapter.send(
+                source.chat_id, text_content, reply_to=event_message_id, metadata=metadata)
         if not getattr(result, "success", False):
             logger.warning(
                 "Queued-lane final send to %s failed: %s", getattr(source, "chat_id", "?"),

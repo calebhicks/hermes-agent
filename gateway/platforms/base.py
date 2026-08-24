@@ -4131,6 +4131,21 @@ class BasePlatformAdapter(ABC):
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
 
+    def busy_input_mode_for_source(self, source: SessionSource) -> Optional[str]:
+        """Optionally override busy input semantics for one source."""
+        del source
+        return None
+
+    async def authorize_persisted_source(self, source: SessionSource) -> Optional[bool]:
+        """Re-authorize a serialized source before restart auto-resume."""
+        del source
+        return None
+
+    async def session_start_context(self, event: MessageEvent) -> Optional[str]:
+        """Return adapter context for an actually new/reset session."""
+        del event
+        return None
+
     def build_source(
         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",
         user_id: Optional[str] = None, user_name: Optional[str] = None,

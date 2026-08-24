@@ -509,3 +509,23 @@ async def test_primary_adapter_busy_origin_uses_routed_privacy(
     assert asdict(event.source) == original
     assert get_hermes_home_override() == ambient
     assert key not in adapter._pending_messages
+
+
+def test_adapter_source_busy_mode_precedes_profile_default():
+    runner = _runner(default_mode="steer")
+    adapter = _adapter()
+    adapter.busy_input_mode_for_source = MagicMock(return_value="queue")
+    runner.adapters[Platform.TELEGRAM] = adapter
+    source = _event(profile=None).source
+
+    assert runner._effective_busy_input_mode(source) == "queue"
+    adapter.busy_input_mode_for_source.assert_called_once_with(source)
+
+
+def test_invalid_adapter_source_busy_mode_preserves_default():
+    runner = _runner(default_mode="interrupt")
+    adapter = _adapter()
+    adapter.busy_input_mode_for_source = MagicMock(return_value="invalid")
+    runner.adapters[Platform.TELEGRAM] = adapter
+
+    assert runner._effective_busy_input_mode(_event(profile=None).source) == "interrupt"

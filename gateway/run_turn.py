@@ -1839,6 +1839,22 @@ class GatewayTurnMixin:
         running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
         from gateway.run import _load_gateway_config
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
+        if _is_new_session:
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                try:
+                    start_context = await adapter.session_start_context(event)
+                except Exception:
+                    logger.warning(
+                        "Platform session-start context hook failed category=adapter_exception"
+                    )
+                else:
+                    if start_context:
+                        existing = str(getattr(event, "channel_context", "") or "")
+                        event.channel_context = (
+                            f"{start_context}\n\n{existing}"
+                            if existing else str(start_context)
+                        )
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)

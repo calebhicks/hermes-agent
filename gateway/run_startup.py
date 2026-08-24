@@ -496,22 +496,40 @@ class GatewayStartupMixin:
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
 
-    def _resume_owner_authorized(self, session_key: str, source) -> bool:
+    async def _resume_owner_authorized(self, session_key: str, source, adapter) -> bool:
         """Validate the session owner against the CURRENT allowlist: a session created before the
         allowlist existed (or whose owner was since removed) must not silently receive a full agent
         response just because it carries a resume marker."""
         try:
-            if self._is_user_authorized(source):
+            adapter_decision = await adapter.authorize_persisted_source(source)
+        except Exception:
+            logger.warning(
+                "Skipping auto-resume for %s: adapter authorization hook failed "
+                "category=adapter_exception",
+                session_key,
+            )
+            return False
+        try:
+            authorized = (
+                self._is_user_authorized(source)
+                if adapter_decision is None
+                else bool(adapter_decision)
+            )
+            if authorized:
                 return True
             logger.warning(
-                "Skipping auto-resume for %s: session owner is no "
-                "longer authorized under the current allowlist", session_key,
+                "Skipping auto-resume for %s: persisted source is no longer authorized",
+                session_key,
             )
-        except Exception as exc:
-            logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
+        except Exception:
+            logger.warning(
+                "Skipping auto-resume for %s: authorization check failed "
+                "category=gateway_exception",
+                session_key,
+            )
         return False
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+    async def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
@@ -538,7 +556,7 @@ class GatewayStartupMixin:
                     getattr(source.platform, "value", source.platform),
                 )
                 continue
-            if not self._resume_owner_authorized(entry.session_key, source):
+            if not await self._resume_owner_authorized(entry.session_key, source, adapter):
                 continue
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
@@ -1256,7 +1274,7 @@ class GatewayStartupMixin:
         )
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
-        self._schedule_resume_pending_sessions()
+        await self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.

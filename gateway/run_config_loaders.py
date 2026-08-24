@@ -301,7 +301,21 @@ class GatewayConfigLoadersMixin:
         return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
 
     def _effective_busy_input_mode(self, source: SessionSource) -> str:
-        """Resolve busy input mode from the routed profile startup snapshot."""
+        """Resolve adapter source override, then routed-profile startup snapshot."""
+        fallback = getattr(self, "_busy_input_mode", "interrupt")
+        adapter = self._adapter_for_source(source)
+        if adapter is not None:
+            try:
+                override = adapter.busy_input_mode_for_source(source)
+            except Exception:
+                logger.warning("Platform busy-input source hook failed category=adapter_exception")
+            else:
+                if override in {"interrupt", "queue", "steer"}:
+                    return override
+                if override is not None:
+                    logger.warning("Platform busy-input source hook failed category=invalid_result")
+        if not self._busy_profile_name_for_source(source):
+            return fallback
         return self._effective_busy_mode(source, "_busy_input_mode")
 
     def _effective_busy_text_mode(self, source: SessionSource) -> str:
