@@ -2673,8 +2673,9 @@ class GatewayTurnMixin:
         def _display_surface_mode(
             setting: str, *, default: bool = False,
             require_platform_override_for: set[Any] | None = None, allow_generic: bool = False,
+            allow_dynamic: bool = False,
         ) -> str:
-            """Return off|raw|generic for a gateway visibility surface."""
+            """Return off|raw|generic|dynamic for a gateway visibility surface."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {_gateway_platform_value(item) for item in require_platform_override_for}
@@ -2686,6 +2687,8 @@ class GatewayTurnMixin:
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() == "dynamic":
+                return "dynamic" if allow_dynamic else "off"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -3790,9 +3793,28 @@ class GatewayTurnMixin:
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
+        _long_running_mode = disp._display_surface_mode(
+            "long_running_notifications",
+            default=True,
+            allow_generic=True,
+            allow_dynamic=True,
+        )
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
             return
+        _dynamic_heartbeat_policy = None
+        _build_dynamic_long_running_status = None
+        if _long_running_mode == "dynamic":
+            try:
+                from gateway.dynamic_status import (
+                    DynamicHeartbeatPolicy,
+                    build_dynamic_long_running_status,
+                )
+
+                _dynamic_heartbeat_policy = DynamicHeartbeatPolicy()
+                _build_dynamic_long_running_status = build_dynamic_long_running_status
+            except Exception as _dyn_err:
+                logger.debug("Dynamic heartbeat setup failed: %s", _dyn_err)
+                return
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata
         _notify_adapter = self._adapter_for_source(source)
@@ -3805,7 +3827,8 @@ class GatewayTurnMixin:
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
                 break
-            _elapsed_mins = int((time.time() - _notify_start) // 60)
+            _elapsed_seconds = time.time() - _notify_start
+            _elapsed_mins = int(_elapsed_seconds // 60)
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
             _status_detail = ""
             _want_iteration_detail = bool(
@@ -3822,13 +3845,35 @@ class GatewayTurnMixin:
                         _parts.append(str(_action))
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
-            _heartbeat_text = (
-                disp._generic_status_phrase("status")
-                if _long_running_mode == "generic"
-                else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-            )
+            _dynamic_status = None
+            if (
+                _long_running_mode == "dynamic"
+                and _dynamic_heartbeat_policy is not None
+                and _build_dynamic_long_running_status is not None
+            ):
+                try:
+                    _dynamic_status = _build_dynamic_long_running_status(
+                        _a,
+                        elapsed_seconds=_elapsed_seconds,
+                    )
+                except Exception as _dyn_err:
+                    logger.debug("Dynamic heartbeat render failed: %s", _dyn_err)
+                    _dynamic_status = None
+                if not _dynamic_heartbeat_policy.should_deliver(
+                    _dynamic_status,
+                    has_edit_target=bool(_heartbeat_msg_id),
+                ):
+                    continue
+                _heartbeat_text = _dynamic_status.text
+            else:
+                _heartbeat_text = (
+                    disp._generic_status_phrase("status")
+                    if _long_running_mode == "generic"
+                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                )
             try:
                 _notify_res = None
+                _sent_new_bubble = False
                 if _heartbeat_msg_id:
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
@@ -3836,14 +3881,34 @@ class GatewayTurnMixin:
                         logger.debug("Heartbeat edit failed: %s", _ee)
                         _notify_res = None
                 if not (_notify_res and getattr(_notify_res, "success", False)):
+                    if (
+                        _long_running_mode == "dynamic"
+                        and _dynamic_heartbeat_policy is not None
+                        and not _dynamic_heartbeat_policy.should_deliver(
+                            _dynamic_status,
+                            has_edit_target=False,
+                        )
+                    ):
+                        continue
                     _notify_res = await _notify_adapter.send(
                         source.chat_id, _heartbeat_text,
                         metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
                     )
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
+                        _sent_new_bubble = True
                         _heartbeat_msg_id = str(_notify_res.message_id)
                         if turn_ctx._cleanup_progress:
                             turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                if (
+                    _long_running_mode == "dynamic"
+                    and _dynamic_status is not None
+                    and _dynamic_heartbeat_policy is not None
+                    and getattr(_notify_res, "success", False)
+                ):
+                    _dynamic_heartbeat_policy.record_delivery(
+                        _dynamic_status,
+                        sent_new_bubble=_sent_new_bubble,
+                    )
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 

@@ -90,16 +90,18 @@ class TestYAMLNormalisation:
         assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
 
 
-    def test_only_long_running_visibility_accepts_generic_mode(self):
+    def test_only_long_running_visibility_accepts_generic_and_dynamic_modes(self):
         from gateway.display_config import resolve_display_setting
 
         config = {
             "display": {
+                "long_running_notifications": "dynamic",
                 "platforms": {
                     "whatsapp": {
                         "thinking_progress": "generic",
                         "interim_assistant_messages": "generic",
                         "long_running_notifications": "generic",
+                        "cleanup_progress": "dynamic",
                     }
                 }
             }
@@ -107,6 +109,8 @@ class TestYAMLNormalisation:
         assert resolve_display_setting(config, "whatsapp", "thinking_progress") is False
         assert resolve_display_setting(config, "whatsapp", "interim_assistant_messages") is False
         assert resolve_display_setting(config, "whatsapp", "long_running_notifications") == "generic"
+        assert resolve_display_setting(config, "telegram", "long_running_notifications") == "dynamic"
+        assert resolve_display_setting(config, "whatsapp", "cleanup_progress") is False
 
     def test_thinking_progress_string_false_normalised_to_false(self):
         from gateway.display_config import resolve_display_setting
@@ -325,5 +329,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 
