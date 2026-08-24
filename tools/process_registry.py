@@ -1356,6 +1356,7 @@ class ProcessRegistry:
             self._check_watch_patterns(session, chunk)
             self._emit_output(session, chunk)
 
+        proc = None
         try:
             proc = session.process
             if proc is None or proc.stdout is None:
@@ -1434,12 +1435,13 @@ class ProcessRegistry:
                 pass
             # Always reap the child to prevent zombie processes.
             try:
-                session.process.wait(timeout=5)
+                if proc is not None:
+                    proc.wait(timeout=5)
             except Exception as e:
                 logger.debug("Process wait timed out or failed: %s", e)
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
+                session.exit_code = getattr(proc, "returncode", None)
                 session.completion_reason = "exited"
             self._move_to_finished(session)
 
@@ -1552,6 +1554,64 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
+    @staticmethod
+    def _close_quietly(handle) -> None:
+        """Best-effort close for stream/transport handles."""
+        if handle is None:
+            return
+        close = getattr(handle, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            pass
+
+    def _release_finished_transports(self, session: ProcessSession) -> None:
+        """Drop local process transports once session history is durable.
+
+        Finished sessions keep command metadata, PID, exit code, output buffer,
+        notification state, and wait/poll/log semantics for the history TTL.
+        They do not need to retain live ``Popen`` or PTY handles, whose stdio
+        descriptors otherwise stay open for that entire window.
+        """
+        streams = []
+        with session._lock:
+            proc = session.process
+            pty = session._pty
+            session.process = None
+            session._pty = None
+
+            seen = set()
+            if proc is not None:
+                for stream in (
+                    getattr(proc, "stdin", None),
+                    getattr(proc, "stdout", None),
+                    getattr(proc, "stderr", None),
+                ):
+                    if stream is None:
+                        continue
+                    marker = id(stream)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    streams.append(stream)
+
+        for stream in streams:
+            self._close_quietly(stream)
+
+        if pty is not None:
+            close = getattr(pty, "close", None)
+            if callable(close):
+                try:
+                    close(force=True)
+                except TypeError:
+                    self._close_quietly(pty)
+                except Exception:
+                    pass
+            else:
+                self._close_quietly(pty)
+
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
 
@@ -1562,6 +1622,7 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+        self._release_finished_transports(session)
         session._completion_event.set()
         self._write_checkpoint()
 
@@ -1805,45 +1866,53 @@ class ProcessRegistry:
         Safe no-op on sessions without a local `Popen` (env/PTY), already-
         exited sessions, and detached-recovered sessions.
         """
-        if session is None or session.exited:
+        if session is None:
             return
-        proc = getattr(session, "process", None)
-        if proc is None:
-            return
-        try:
-            rc = proc.poll()
-        except Exception:
-            return
-        if rc is None:
-            return  # Direct child still running — reader block is legitimate.
 
         # Direct child exited. Try to drain any bytes the reader hasn't
         # consumed yet. This is best-effort: if the pipe is held open by a
         # descendant, the non-blocking read returns what's immediately
         # available and we stop.
         drained = ""
-        stdout = getattr(proc, "stdout", None)
-        if stdout is not None and not _IS_WINDOWS:
-            try:
-                import fcntl
-                fd = stdout.fileno()
-                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                try:
-                    chunk = stdout.read()
-                    if chunk:
-                        drained = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
-                except (BlockingIOError, OSError, ValueError):
-                    pass
-                finally:
-                    try:
-                        fcntl.fcntl(fd, fcntl.F_SETFL, flags)
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
-
+        rc = None
         with session._lock:
+            if session.exited:
+                return
+            proc = getattr(session, "process", None)
+            if proc is None:
+                return
+            try:
+                rc = proc.poll()
+            except Exception:
+                return
+            if rc is None:
+                return  # Direct child still running — reader block is legitimate.
+
+            stdout = getattr(proc, "stdout", None)
+            if stdout is not None and not _IS_WINDOWS:
+                try:
+                    import fcntl
+                    fd = stdout.fileno()
+                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                    try:
+                        chunk = stdout.read()
+                        if chunk:
+                            drained = (
+                                chunk
+                                if isinstance(chunk, str)
+                                else chunk.decode("utf-8", errors="replace")
+                            )
+                    except (BlockingIOError, OSError, ValueError):
+                        pass
+                    finally:
+                        try:
+                            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
+
             if drained:
                 session.output_buffer += drained
                 if len(session.output_buffer) > session.max_output_chars:
@@ -1852,6 +1921,7 @@ class ProcessRegistry:
             if session.completion_reason != "killed":
                 session.exit_code = rc
                 session.completion_reason = "exited"
+
         logger.info(
             "Reconciled session %s: direct child exited with code %s but reader "
             "was still blocked (orphaned pipe). Flipped to exited.",
@@ -2108,24 +2178,46 @@ class ProcessRegistry:
                 self._completion_consumed.add(session_id)
             return result
 
+        with session._lock:
+            if session.exited:
+                result = {
+                    "status": "already_exited",
+                    "command": session.command,
+                    "exit_code": session.exit_code,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                    "output": strip_ansi(session.output_buffer[-2000:]),
+                }
+                if consume_output:
+                    self._completion_consumed.add(session_id)
+                return result
+            pty = session._pty
+            proc = session.process
+            env_ref = session.env_ref
+            pid = session.pid
+            host_start_time = session.host_start_time
+            detached = session.detached
+            pid_scope = session.pid_scope
+            systemd_unit = session.systemd_unit
+
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
-            if session._pty:
+            if pty is not None:
                 # PTY process -- terminate via ptyprocess
                 try:
-                    session._pty.terminate(force=True)
+                    pty.terminate(force=True)
                 except Exception:
-                    if session.pid:
-                        os.kill(session.pid, signal.SIGTERM)
-            elif session.process:
+                    if pid:
+                        os.kill(pid, signal.SIGTERM)
+            elif proc is not None:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
-                self._terminate_host_pid(session.process.pid, session.host_start_time)
-            elif session.env_ref and session.pid:
+                self._terminate_host_pid(proc.pid, host_start_time)
+            elif env_ref and pid:
                 # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
-            elif session.detached and session.pid_scope == "host" and session.pid:
+                env_ref.execute(f"kill {pid} 2>/dev/null", timeout=5)
+            elif detached and pid_scope == "host" and pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
                 # exited and never tree-kill the stranger.  If this recovered
@@ -2133,9 +2225,9 @@ class ProcessRegistry:
                 # before returning: a daemonized descendant may still be alive
                 # there even though the wrapper PID exited or was recycled
                 # across the gateway restart (#70716, teknium1 review).
-                if not self._host_pid_is_ours(session.pid, session.host_start_time):
-                    if session.systemd_unit:
-                        _stop_systemd_unit(session.systemd_unit)
+                if not self._host_pid_is_ours(pid, host_start_time):
+                    if systemd_unit:
+                        _stop_systemd_unit(systemd_unit)
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
@@ -2148,7 +2240,7 @@ class ProcessRegistry:
                         "exit_code": session.exit_code,
                         "output": output,
                     }
-                self._terminate_host_pid(session.pid, session.host_start_time)
+                self._terminate_host_pid(pid, host_start_time)
             else:
                 return {
                     "status": "error",
