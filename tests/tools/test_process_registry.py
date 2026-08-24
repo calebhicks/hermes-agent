@@ -415,6 +415,509 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
     assert "\ufffd" not in session.output_buffer
 
 
+class _CloseAwareStream:
+    def __init__(self, chunks=None):
+        self.buffer = _FakeChunkBuffer(chunks or [])
+        self.closed = False
+        self.close_count = 0
+
+    def close(self):
+        self.closed = True
+        self.close_count += 1
+
+
+class _CloseAwareProcess:
+    def __init__(self, chunks=None, returncode=0, pid=12345):
+        self.stdin = _CloseAwareStream()
+        self.stdout = _CloseAwareStream(chunks or [])
+        self.stderr = _CloseAwareStream()
+        self.returncode = returncode
+        self.pid = pid
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+
+class _CloseAwarePty:
+    def __init__(self, chunks=None, exitstatus=0, pid=12346):
+        self._chunks = list(chunks or [])
+        self.exitstatus = exitstatus
+        self.pid = pid
+        self.closed = False
+        self.close_force_args = []
+        self.terminated = False
+        self.terminate_force_args = []
+
+    def isalive(self):
+        return bool(self._chunks)
+
+    def read(self, _n):
+        if self._chunks:
+            return self._chunks.pop(0)
+        raise EOFError
+
+    def wait(self):
+        return self.exitstatus
+
+    def close(self, force=False):
+        self.closed = True
+        self.close_force_args.append(force)
+
+    def terminate(self, force=False):
+        self.terminated = True
+        self.terminate_force_args.append(force)
+
+
+class _ForceRejectingClosePty:
+    def __init__(self):
+        self.closed = False
+        self.close_count = 0
+        self.rejected_calls = []
+
+    def close(self, *args, **kwargs):
+        if args or kwargs:
+            self.rejected_calls.append((args, kwargs))
+            raise TypeError("close() got an unexpected keyword argument 'force'")
+        self.closed = True
+        self.close_count += 1
+
+
+class TestFinishedTransportCleanup:
+    def test_release_detaches_under_lock_but_closes_transports_after_unlock(self, registry):
+        """Regression for blocking close paths that re-enter session state.
+
+        Windows pipe close can wait on a blocking reader; model that without
+        platform dependence by making every close try to acquire session._lock.
+        """
+        session = _make_session(
+            sid="proc_release_close_lock_boundary",
+            exited=True,
+            exit_code=0,
+            output="history stays",
+        )
+        session.pid = 24686
+        session.watcher_platform = "telegram"
+        session.notify_on_complete = True
+        session.watch_patterns = ["READY"]
+        lock_checks = []
+
+        class _LockCheckingStream(_CloseAwareStream):
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+
+            def close(self):
+                acquired = session._lock.acquire(blocking=False)
+                lock_checks.append((self.name, acquired))
+                if acquired:
+                    session._lock.release()
+                super().close()
+
+        class _LockCheckingPty(_CloseAwarePty):
+            def close(self, force=False):
+                acquired = session._lock.acquire(blocking=False)
+                lock_checks.append(("pty", acquired, force))
+                if acquired:
+                    session._lock.release()
+                super().close(force=force)
+
+        proc = _CloseAwareProcess(returncode=0, pid=session.pid)
+        proc.stdin = _LockCheckingStream("stdin")
+        proc.stdout = _LockCheckingStream("stdout")
+        proc.stderr = _LockCheckingStream("stderr")
+        pty = _LockCheckingPty(pid=session.pid)
+        session.process = proc
+        session._pty = pty
+
+        registry._release_finished_transports(session)
+        registry._release_finished_transports(session)
+
+        assert session.process is None
+        assert session._pty is None
+        assert session.pid == 24686
+        assert session.exit_code == 0
+        assert session.output_buffer == "history stays"
+        assert session.watcher_platform == "telegram"
+        assert session.notify_on_complete is True
+        assert session.watch_patterns == ["READY"]
+        assert lock_checks == [
+            ("stdin", True),
+            ("stdout", True),
+            ("stderr", True),
+            ("pty", True, True),
+        ]
+        assert proc.stdin.close_count == 1
+        assert proc.stdout.close_count == 1
+        assert proc.stderr.close_count == 1
+        assert pty.close_force_args == [True]
+
+    def test_pipe_normal_exit_closes_stdio_and_clears_process_reference(self, registry, monkeypatch):
+        proc = _CloseAwareProcess(
+            chunks=[b"done\n"],
+            returncode=0,
+            pid=24680,
+        )
+        session = _make_session(sid="proc_pipe_cleanup")
+        session.pid = proc.pid
+        session.process = proc
+        registry._running[session.id] = session
+
+        monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+        monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+        with patch.object(registry, "_write_checkpoint"):
+            registry._reader_loop(session)
+
+        assert session.exited is True
+        assert session.exit_code == 0
+        assert session.pid == 24680
+        assert session.output_buffer == "done\n"
+        assert session.process is None
+        assert proc.stdin.closed is True
+        assert proc.stdout.closed is True
+        assert proc.stderr.closed is True
+        assert registry.poll(session.id)["status"] == "exited"
+        assert registry.read_log(session.id)["output"] == "done"
+        assert registry.wait(session.id, timeout=1)["exit_code"] == 0
+
+        registry._move_to_finished(session)
+        assert proc.stdin.close_count == 1
+        assert proc.stdout.close_count == 1
+        assert proc.stderr.close_count == 1
+
+    def test_pipe_reader_is_safe_when_finish_races_with_callback(self, registry, monkeypatch):
+        proc = _CloseAwareProcess(
+            chunks=[b"race\n"],
+            returncode=0,
+            pid=24684,
+        )
+        session = _make_session(sid="proc_pipe_cleanup_race")
+        session.pid = proc.pid
+        session.process = proc
+        registry._running[session.id] = session
+
+        monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+
+        moved_from_callback = False
+
+        def finish_from_callback(_session, _chunk):
+            nonlocal moved_from_callback
+            if not moved_from_callback:
+                moved_from_callback = True
+                registry._move_to_finished(session)
+
+        monkeypatch.setattr(registry, "_emit_output", finish_from_callback)
+        with patch.object(registry, "_write_checkpoint"):
+            registry._reader_loop(session)
+
+        assert moved_from_callback is True
+        assert session.exited is True
+        assert session.exit_code == 0
+        assert session.process is None
+        assert session.output_buffer == "race\n"
+        assert proc.stdin.close_count == 1
+        assert proc.stdout.close_count == 1
+        assert proc.stderr.close_count == 1
+
+    def test_pipe_kill_closes_stdio_and_preserves_history(self, registry, monkeypatch):
+        proc = _CloseAwareProcess(returncode=None, pid=24681)
+        session = _make_session(
+            sid="proc_pipe_kill_cleanup",
+            output="partial output",
+        )
+        session.pid = proc.pid
+        session.process = proc
+        registry._running[session.id] = session
+
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_terminate_host_pid",
+            staticmethod(lambda _pid, _expected_start=None: None),
+        )
+        with patch.object(registry, "_write_checkpoint"):
+            result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed"
+        assert session.exited is True
+        assert session.exit_code == -15
+        assert session.pid == 24681
+        assert session.output_buffer == "partial output"
+        assert session.process is None
+        assert proc.stdin.closed is True
+        assert proc.stdout.closed is True
+        assert proc.stderr.closed is True
+        assert registry.poll(session.id)["status"] == "exited"
+        assert "partial output" in registry.read_log(session.id)["output"]
+
+        registry._move_to_finished(session)
+        assert proc.stdin.close_count == 1
+        assert proc.stdout.close_count == 1
+        assert proc.stderr.close_count == 1
+
+    def test_pty_normal_exit_closes_handle_and_clears_reference(self, registry, monkeypatch):
+        pty = _CloseAwarePty(chunks=[b"pty done\n"], exitstatus=0, pid=24682)
+        session = _make_session(sid="proc_pty_cleanup")
+        session.pid = pty.pid
+        session._pty = pty
+        registry._running[session.id] = session
+
+        monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+        monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+        with patch.object(registry, "_write_checkpoint"):
+            registry._pty_reader_loop(session)
+
+        assert session.exited is True
+        assert session.exit_code == 0
+        assert session.pid == 24682
+        assert session.output_buffer == "pty done\n"
+        assert session._pty is None
+        assert pty.closed is True
+        assert pty.close_force_args == [True]
+        assert registry.poll(session.id)["status"] == "exited"
+        assert registry.read_log(session.id)["output"] == "pty done"
+
+        registry._move_to_finished(session)
+        assert pty.close_force_args == [True]
+
+    def test_pty_kill_terminates_closes_handle_and_preserves_history(self, registry):
+        pty = _CloseAwarePty(pid=24683)
+        session = _make_session(
+            sid="proc_pty_kill_cleanup",
+            output="pty partial",
+        )
+        session.pid = pty.pid
+        session._pty = pty
+        registry._running[session.id] = session
+
+        with patch.object(registry, "_write_checkpoint"):
+            result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed"
+        assert pty.terminated is True
+        assert pty.terminate_force_args == [True]
+        assert pty.closed is True
+        assert pty.close_force_args == [True]
+        assert session.exited is True
+        assert session.exit_code == -15
+        assert session.pid == 24683
+        assert session.output_buffer == "pty partial"
+        assert session._pty is None
+        assert registry.poll(session.id)["status"] == "exited"
+        assert "pty partial" in registry.read_log(session.id)["output"]
+
+        registry._move_to_finished(session)
+        assert pty.close_force_args == [True]
+
+    def test_pty_close_falls_back_when_handle_rejects_force_kwarg(self, registry):
+        pty = _ForceRejectingClosePty()
+        session = _make_session(sid="proc_pty_force_close_fallback")
+        session._pty = pty
+        registry._running[session.id] = session
+
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        assert session._pty is None
+        assert pty.rejected_calls == [((), {"force": True})]
+        assert pty.closed is True
+        assert pty.close_count == 1
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: select() on pipes")
+    def test_pipe_select_reader_cleanup_is_safe_with_concurrent_readers(
+        self, registry, monkeypatch
+    ):
+        import select as select_mod
+
+        original_select = select_mod.select
+        select_calls = 0
+
+        def counting_select(*args, **kwargs):
+            nonlocal select_calls
+            select_calls += 1
+            return original_select(*args, **kwargs)
+
+        monkeypatch.setattr(select_mod, "select", counting_select)
+        proc = subprocess.Popen(
+            [
+                "sh",
+                "-c",
+                "for i in 1 2 3 4 5; do printf 'line-%s\\n' \"$i\"; sleep 0.03; done",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            preexec_fn=os.setsid,
+        )
+        session = _make_session(sid="proc_pipe_select_cleanup")
+        session.pid = proc.pid
+        session.process = proc
+        registry._running[session.id] = session
+
+        done = threading.Event()
+        stop_readers = threading.Event()
+        errors = []
+
+        def run_reader_loop():
+            try:
+                registry._reader_loop(session)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        def read_until_finished():
+            while not stop_readers.is_set():
+                try:
+                    registry.poll(session.id)
+                    registry.read_log(session.id)
+                except Exception as exc:
+                    errors.append(exc)
+                    stop_readers.set()
+                    return
+                if session.exited and session.process is None:
+                    return
+                time.sleep(0.005)
+
+        reader_thread = threading.Thread(target=run_reader_loop, daemon=True)
+        api_threads = [
+            threading.Thread(target=read_until_finished, daemon=True)
+            for _ in range(3)
+        ]
+
+        with patch.object(registry, "_write_checkpoint"):
+            reader_thread.start()
+            for thread in api_threads:
+                thread.start()
+            assert done.wait(timeout=5.0), "select-based pipe reader did not finish"
+            stop_readers.set()
+            for thread in api_threads:
+                thread.join(timeout=1.0)
+
+        assert errors == []
+        assert select_calls > 0
+        assert session.exited is True
+        assert session.exit_code == 0
+        assert session.process is None
+        assert "line-5" in session.output_buffer
+        assert registry.poll(session.id)["status"] == "exited"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: raw fcntl drain")
+    def test_orphan_reconcile_fcntl_drain_is_serialized_with_transport_release(
+        self, registry, monkeypatch
+    ):
+        import fcntl
+
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"tail from orphan\n")
+        os.close(write_fd)
+
+        fileno_seen = threading.Event()
+        release_closed = threading.Event()
+        original_fcntl = fcntl.fcntl
+        fcntl_ops = []
+        recycled_fd_ops = []
+
+        class _RecyclingStdout:
+            def __init__(self, fd):
+                self.fd = fd
+                self.recycled_fd = None
+                self.closed = False
+
+            def fileno(self):
+                fileno_seen.set()
+                return self.fd
+
+            def read(self):
+                try:
+                    data = os.read(self.fd, 4096)
+                except BlockingIOError:
+                    return ""
+                return data.decode("utf-8", errors="replace")
+
+            def close(self):
+                if self.closed:
+                    return
+                self.closed = True
+                os.close(self.fd)
+                self.recycled_fd = os.open(os.devnull, os.O_RDONLY)
+                release_closed.set()
+
+        stdout = _RecyclingStdout(read_fd)
+
+        class _ExitedProcess:
+            stdin = None
+            stderr = None
+            pid = 24685
+
+            def __init__(self):
+                self.stdout = stdout
+                self.returncode = 0
+
+            def poll(self):
+                return 0
+
+        def checked_fcntl(fd, op, *args):
+            if op == fcntl.F_GETFL:
+                # In the old race, release can close/recycle the fd after
+                # stdout.fileno() but before the first raw fcntl operation.
+                release_closed.wait(timeout=0.25)
+            if fd == stdout.fd and stdout.recycled_fd == stdout.fd:
+                recycled_fd_ops.append(op)
+            fcntl_ops.append(op)
+            return original_fcntl(fd, op, *args)
+
+        monkeypatch.setattr(fcntl, "fcntl", checked_fcntl)
+
+        session = _make_session(sid="proc_orphan_reconcile_release_race")
+        session.pid = 24685
+        session.process = _ExitedProcess()
+        registry._running[session.id] = session
+
+        errors = []
+
+        def reconcile():
+            try:
+                registry._reconcile_local_exit(session)
+            except Exception as exc:
+                errors.append(exc)
+
+        def release():
+            try:
+                assert fileno_seen.wait(timeout=2.0)
+                registry._release_finished_transports(session)
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(registry, "_write_checkpoint"):
+            reconcile_thread = threading.Thread(target=reconcile, daemon=True)
+            release_thread = threading.Thread(target=release, daemon=True)
+            reconcile_thread.start()
+            release_thread.start()
+            reconcile_thread.join(timeout=3.0)
+            release_thread.join(timeout=3.0)
+
+        try:
+            assert not reconcile_thread.is_alive()
+            assert not release_thread.is_alive()
+            assert errors == []
+            assert fcntl.F_GETFL in fcntl_ops
+            assert fcntl.F_SETFL in fcntl_ops
+            assert recycled_fd_ops == []
+            assert session.exited is True
+            assert session.exit_code == 0
+            assert "tail from orphan" in session.output_buffer
+            assert session.process is None
+        finally:
+            if stdout.recycled_fd is not None:
+                os.close(stdout.recycled_fd)
+            elif not stdout.closed:
+                os.close(stdout.fd)
+
+
 # =========================================================================
 # Orphaned-pipe reconciliation (issue #17327)
 # =========================================================================
@@ -1229,6 +1732,49 @@ class TestKillProcess:
         registry._finished[s.id] = s
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
+
+    def test_kill_race_with_finished_cleanup_returns_already_exited(self, registry, monkeypatch):
+        class _RaceFinishedSession:
+            def __init__(self):
+                self.id = "proc_kill_finish_race"
+                self.command = "printf done"
+                self.exit_code = 0
+                self.completion_reason = "exited"
+                self.termination_source = ""
+                self.output_buffer = "done\n"
+                self.process = object()
+                self._pty = None
+                self.env_ref = None
+                self.pid = None
+                self.detached = False
+                self.pid_scope = "host"
+                self._lock = threading.Lock()
+                self._exited = False
+                self._exited_reads = 0
+
+            @property
+            def exited(self):
+                if self._exited_reads == 0:
+                    self._exited_reads += 1
+                    self._exited = True
+                    self.process = None
+                    self._pty = None
+                    return False
+                return self._exited
+
+            @exited.setter
+            def exited(self, value):
+                self._exited = value
+
+        session = _RaceFinishedSession()
+        monkeypatch.setattr(registry, "get", lambda _session_id: session)
+
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "already_exited"
+        assert result["exit_code"] == 0
+        assert result["completion_reason"] == "exited"
+        assert result["output"] == "done\n"
 
 
     def test_kill_detached_session_uses_host_pid(self, registry):
