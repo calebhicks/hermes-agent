@@ -313,6 +313,16 @@ KANBAN_GUIDANCE = (
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
 
+
+def kanban_worker_guidance(valid_tool_names) -> str:
+    """Return worker lifecycle guidance only for a task-bound process."""
+    return (
+        KANBAN_GUIDANCE
+        if os.environ.get("HERMES_KANBAN_TASK")
+        and "kanban_show" in valid_tool_names
+        else ""
+    )
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do or plan to do without actually doing "

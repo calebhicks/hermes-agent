@@ -217,7 +217,14 @@ def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Opt
     create_thread = getattr(adapter, "create_handoff_thread", None)
     if not callable(create_thread) or loop is None:
         return None
-    thread_name = f"Hermes — {job.get('name') or job.get('id', 'cron')}"
+    task_name = job.get("name") or job.get("id", "cron")
+    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+    requested_title = origin.get("thread_title")
+    thread_name = (
+        requested_title.strip()
+        if isinstance(requested_title, str) and requested_title.strip()
+        else f"Hermes — {task_name}"
+    )
     try:
         from agent.async_utils import safe_schedule_threadsafe
         coro = create_thread(str(chat_id), thread_name)

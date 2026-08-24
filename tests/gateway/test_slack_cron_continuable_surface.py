@@ -19,7 +19,9 @@ D1/D4/D5/D6.
 
 import logging
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -110,3 +112,20 @@ def test_no_warning_when_properly_paired(caplog):
                    for r in caplog.records)
 
 
+@pytest.mark.asyncio
+async def test_handoff_seed_uses_audience_title_without_hermes_frontmatter():
+    adapter = _make_adapter({})
+    adapter._app = object()
+    client = MagicMock()
+    client.chat_postMessage = AsyncMock(return_value={"ts": "123.456"})
+    adapter._get_client = MagicMock(return_value=client)
+
+    thread_id = await adapter.create_handoff_thread(
+        "D123", "Daily GTM Brief — 2026-08-14"
+    )
+
+    assert thread_id == "123.456"
+    client.chat_postMessage.assert_awaited_once_with(
+        channel="D123",
+        text=":thread: *Daily GTM Brief — 2026-08-14*",
+    )
