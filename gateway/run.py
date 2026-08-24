@@ -2657,6 +2657,7 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    DegradedTranscript,
     SessionEntry,
     SessionStore,
     SessionSource,
@@ -19282,7 +19283,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
-        
+        if isinstance(history, DegradedTranscript):
+            # The store FAILED to read this session (e.g. state.db
+            # corruption) — the turn proceeds, but the model must know the
+            # emptiness is a storage failure, not a fresh conversation.
+            logger.warning(
+                "TRANSCRIPT_READ_DEGRADED: serving turn without history "
+                "for session %s: %s",
+                session_entry.session_id, history.error,
+            )
+            turn_sidecar_notes.append(
+                "[System note: The transcript store failed to load this "
+                "session's history (storage error), so you have NO prior "
+                "conversation context this turn — but the conversation "
+                "itself is NOT new. Do not guess at prior context and do "
+                "not treat this as a fresh conversation; if the user refers "
+                "to something earlier, say your view of the history is "
+                "temporarily unavailable and ask them to restate or quote "
+                "it.]"
+            )
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #

@@ -1218,6 +1218,20 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+class DegradedTranscript(list):
+    """Empty transcript returned when the store FAILED to read a session.
+
+    A ``list`` subclass so every existing caller keeps treating it as an
+    empty history; the live-turn path in ``gateway/run.py`` checks for it
+    and tells the model this turn is running without history instead of
+    letting a storage failure look like a fresh conversation.
+    """
+
+    def __init__(self, error: str = "") -> None:
+        super().__init__()
+        self.error = error
+
+
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
@@ -3996,13 +4010,19 @@ class SessionStore:
         except Exception as e:
             # A failed read must be distinguishable from an empty transcript:
             # downstream guards treat [] as "nothing persisted" and may make
-            # routing decisions on it (#82616). WARNING, not DEBUG.
+            # routing decisions on it (#82616). WARNING, not DEBUG. Returning
+            # DegradedTranscript keeps every list-shaped consumer working
+            # while letting the live-turn path tell the model it is running
+            # without history — a storage failure must not impersonate a
+            # fresh conversation (2026-08-20 state.db corruption: hours of
+            # turns silently ran context-free).
             logger.warning(
-                "Transcript read failed for session %s (returning empty; "
-                "downstream must not treat this as data loss): %s",
+                "TRANSCRIPT_READ_DEGRADED: transcript read failed for "
+                "session %s (returning empty; downstream must not treat "
+                "this as data loss): %s",
                 session_id, e,
             )
-            return []
+            return DegradedTranscript(str(e))
 
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.
