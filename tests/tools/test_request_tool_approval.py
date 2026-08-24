@@ -6,6 +6,8 @@ Tier-2 dangerous-command match: session/permanent allowlist, the CLI prompt,
 the gateway submit_pending path, cron_mode, and fail-closed timeouts.
 """
 
+from unittest.mock import Mock
+
 import pytest
 
 import tools.approval as approval
@@ -140,6 +142,47 @@ class TestRequestToolApproval:
         res = request_tool_approval("terminal", "smtp send")
         assert res["approved"] is False
         assert "no interactive user or gateway" in res["message"].lower()
+
+    def test_always_prompt_ignores_yolo_and_cached_approval(self, monkeypatch):
+        monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: True)
+        monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        prompt = Mock(return_value="once")
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", prompt)
+        result = request_tool_approval(
+            "nb_canada_execute", "one live read", always_prompt=True
+        )
+        assert result["approved"] is True
+        prompt.assert_called_once()
+
+    def test_always_prompt_blocks_unattended_even_if_cron_autoapproves(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: True)
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "approve")
+        result = request_tool_approval(
+            "nb_canada_execute", "one live read", always_prompt=True
+        )
+        assert result["approved"] is False
+
+    def test_always_prompt_gateway_denial_never_persists(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda data: None)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda *args, **kwargs: {"resolved": True, "choice": "deny"},
+        )
+        persist = Mock()
+        monkeypatch.setattr(approval, "approve_session", persist)
+        monkeypatch.setattr(approval, "approve_permanent", persist)
+        result = request_tool_approval(
+            "nb_canada_execute", "one live read", always_prompt=True
+        )
+        assert result["approved"] is False
+        assert result["user_consent"] is False
+        persist.assert_not_called()
 
     def test_yolo_session_bypasses_gate(self, monkeypatch):
         """A --yolo session skips the plugin approval gate (parity with the

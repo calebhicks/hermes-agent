@@ -812,6 +812,17 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
             return {"action": "block", "message": _block_message(data.get("message"), data.get("reason"))}
         if data.get("decision") == "block":
             return {"action": "block", "message": _block_message(data.get("reason"), data.get("message"))}
+        if data.get("action") == "approve":
+            result = {
+                "action": "approve",
+                "message": _block_message(data.get("message"), data.get("reason")),
+            }
+            rule_key = data.get("rule_key")
+            if isinstance(rule_key, str) and rule_key.strip():
+                result["rule_key"] = rule_key.strip()
+            if data.get("always_prompt") is True:
+                result["always_prompt"] = True
+            return result
         # "modify" action — transform tool_input before dispatch
         if data.get("action") == "modify":
             new_args = data.get("args")

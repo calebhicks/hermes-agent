@@ -3423,6 +3423,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    always_prompt: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3461,6 +3462,8 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        always_prompt: Ignore yolo and cached approvals, require an attached
+            interactive human for this call, and never persist the answer.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3469,11 +3472,13 @@ def _run_approval_gate(
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    if not always_prompt and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not always_prompt and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
     approval_callback = _resolve_cli_approval_callback(approval_callback)
@@ -3488,6 +3493,17 @@ def _run_approval_gate(
     if _is_single_query_approval_context():
         is_cli = False
         is_gateway = False
+
+    if always_prompt and not is_cli and not is_gateway:
+        return {
+            "approved": False,
+            "message": no_human_block_message or (
+                f"BLOCKED: approval required ({description}) but no "
+                "interactive user or gateway is present to approve it."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
 
     if not is_cli and not is_gateway:
         # Single-query (-q) sessions: respect single_query_mode config
@@ -3564,8 +3580,8 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
-                "allow_session": True,
+                "allow_permanent": not always_prompt,
+                "allow_session": not always_prompt,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -3604,9 +3620,9 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
-            if choice == "session":
+            if choice == "session" and not always_prompt:
                 approve_session(session_key, pattern_key)
-            elif choice == "always":
+            elif choice == "always" and not always_prompt:
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
                 save_permanent_allowlist(_permanent_approved)
@@ -3690,9 +3706,9 @@ def _run_approval_gate(
             "user_consent": False,
         }
 
-    if choice == "session":
+    if choice == "session" and not always_prompt:
         approve_session(session_key, pattern_key)
-    elif choice == "always":
+    elif choice == "always" and not always_prompt:
         approve_session(session_key, pattern_key)
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
@@ -3797,6 +3813,7 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    always_prompt: bool = False,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3824,6 +3841,9 @@ def request_tool_approval(
             on the same tool).
         approval_callback: Optional CLI callback for interactive prompts
             (same contract as ``check_dangerous_command``).
+        always_prompt: Require a fresh human decision for this call even under
+            yolo or a cached session/permanent approval. Unattended contexts
+            fail closed and session/always answers are not persisted.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or
@@ -3882,6 +3902,7 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
+        always_prompt=always_prompt,
     )
 
 
