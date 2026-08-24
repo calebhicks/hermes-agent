@@ -399,6 +399,17 @@ def _parse_pre_tool_call(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     for verb, primary, secondary, _ in _PRE_TOOL_DIALECTS:
         if data.get(verb) == "block":
             return {"action": "block", "message": _block_message(data.get(primary), data.get(secondary))}
+    if data.get("action") == "approve":
+        result = {
+            "action": "approve",
+            "message": _block_message(data.get("message"), data.get("reason")),
+        }
+        rule_key = data.get("rule_key")
+        if isinstance(rule_key, str) and rule_key.strip():
+            result["rule_key"] = rule_key.strip()
+        if data.get("always_prompt") is True:
+            result["always_prompt"] = True
+        return result
     for verb, _, _, payload in _PRE_TOOL_DIALECTS:
         if data.get(verb) == "modify" and isinstance(data.get(payload), dict):
             return {"action": "modify", "args": data[payload]}

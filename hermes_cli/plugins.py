@@ -1759,6 +1759,7 @@ class _PreToolCallDirective:
     message: Optional[str] = None
     rule_key: Optional[str] = None
     modified_args: Optional[Dict[str, Any]] = None
+    always_prompt: bool = False
 
 
 def set_thread_tool_whitelist(
@@ -1815,7 +1816,16 @@ def _get_pre_tool_call_directive_details(
             continue
         rule_key = result.get("rule_key") if action == "approve" else None
         rule_key = (rule_key.strip() or None) if isinstance(rule_key, str) else None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key, modified_args=modified_args)
+        always_prompt = bool(
+            action == "approve" and result.get("always_prompt") is True
+        )
+        return _PreToolCallDirective(
+            action=action,
+            message=message,
+            rule_key=rule_key,
+            modified_args=modified_args,
+            always_prompt=always_prompt,
+        )
     return _PreToolCallDirective(modified_args=modified_args)
 
 
@@ -1862,7 +1872,12 @@ def _resolve_block_from_details(
             approval_tokens = set_current_observability_context(
                 turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id)
         try:
-            result = request_tool_approval(tool_name, details.message or "", rule_key=details.rule_key or tool_name)
+            result = request_tool_approval(
+                tool_name,
+                details.message or "",
+                rule_key=details.rule_key or tool_name,
+                always_prompt=details.always_prompt,
+            )
         finally:
             if approval_tokens is not None:
                 with suppress(Exception):
