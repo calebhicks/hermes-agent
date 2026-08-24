@@ -1272,7 +1272,8 @@ def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
     *,
-    interactive: bool = True,
+    interactive: bool = False,
+    recent_context: str = "",
 ) -> str:
     """Build the resume-pending recovery system note for an interrupted turn.
 
@@ -1282,13 +1283,12 @@ def build_resume_recovery_note(
     startup auto-resume turn synthesized by
     ``_schedule_resume_pending_sessions`` with no human message attached.
 
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``interactive`` is an explicit opt-in to the older "report the restore and
+    ask what next" behavior. The default quietly completes interrupted work;
+    durable recovery should not expose gateway lifecycle plumbing.
+
+    ``recent_context`` is bounded, adapter-provided transport evidence used to
+    cover the crash window between receipt and durable transcript persistence.
     """
     reason_phrase = (
         "a gateway restart"
@@ -1327,14 +1327,18 @@ def build_resume_recovery_note(
             "appear in the history — resume from the first step "
             "that has no recorded result."
         )
-    return (
+    note = (
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "
         f"Any restart/shutdown command in the history has already "
         f"run — do NOT re-execute or verify it. {resume_guidance} "
         f"{tail_guidance}]"
-        + (f"\n\n{message}" if message else "")
     )
+    if recent_context:
+        note += f"\n\n{recent_context}"
+    if message:
+        note += f"\n\n[New message]\n{message}"
+    return note
 
 
 def _prepare_resume_pending_message(
@@ -1342,6 +1346,7 @@ def _prepare_resume_pending_message(
     message: Optional[str],
     *,
     interactive: bool = True,
+    recent_context: str = "",
 ) -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
@@ -1355,7 +1360,10 @@ def _prepare_resume_pending_message(
     non-empty row never trips the sanitizer.
     """
     recovery_message = build_resume_recovery_note(
-        reason, message or "", interactive=interactive,
+        reason,
+        message or "",
+        interactive=interactive,
+        recent_context=recent_context,
     )
     persist_message = (
         message if isinstance(message, str) and message.strip() else recovery_message
@@ -6294,17 +6302,18 @@ class TurnRunner:
             # The empty-message case is the auto-resume startup turn
             # synthesized by _schedule_resume_pending_sessions — there is
             # no NEW user message to address.  Guidance is adapter-aware:
-            # interactive platforms report the restore and ask what next;
-            # non-interactive event platforms (webhook, API server)
-            # continue the interrupted work instead, because nobody is
-            # present to answer and an acknowledgement would silently
-            # abandon the task (#57056).
+            # adapters may explicitly opt into reporting the restore and
+            # asking what next; the safe default quietly continues because a
+            # lifecycle acknowledgement would abandon the task (#57056).
             _resume_adapter = self._runner._adapter_for_source(ctx.source)
             _interactive_resume = bool(
-                getattr(_resume_adapter, "interactive_resume", True)
+                getattr(_resume_adapter, "interactive_resume", False)
             )
             ctx.message, _persist_user_message_override = _prepare_resume_pending_message(
-                _reason, ctx.message, interactive=_interactive_resume,
+                _reason,
+                ctx.message,
+                interactive=_interactive_resume,
+                recent_context=ctx.resume_context or "",
             )
         elif _has_fresh_tool_tail:
             _persist_user_message_override = ctx.message
@@ -6350,8 +6359,9 @@ class TurnRunner:
                 _sn_reason,
                 "",
                 interactive=bool(
-                    getattr(_sn_adapter, "interactive_resume", True)
+                    getattr(_sn_adapter, "interactive_resume", False)
                 ),
+                recent_context=ctx.resume_context or "",
             )
 
         _approval_session_key = ctx.session_key or ""
@@ -8952,6 +8962,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
 
+    def _drain_rejection_message(self) -> str:
+        if self._restart_requested:
+            return (
+                "I’m restarting for a moment and couldn’t save this message. "
+                "Please send it again shortly."
+            )
+        return (
+            "I’m going offline and couldn’t save this message. "
+            "Please send it again when I’m back."
+        )
+
     def _queue_during_drain_enabled(
         self, busy_input_mode: Optional[str] = None
     ) -> bool:
@@ -10189,9 +10210,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                # The resumed answer is the acknowledgement; routine restarts
+                # remain invisible when this message is durably queued.
+                return True
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = self._drain_rejection_message()
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -10804,14 +10827,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
-        action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+        msg = (
+            "I need to restart for a moment, so I’m pausing this. "
+            "I’ll pick it back up when I’m back."
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else "I’m going offline, so I have to stop this for now."
         )
-        msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
@@ -12149,10 +12170,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scheduled at startup is never resumed a second time.
         """
         window = _auto_continue_freshness_window()
-        try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+
+        def _snapshot_resume_candidates():
+            # SessionStore is synchronous and thread-safe. Keep its lock and
+            # private loaded-index access wholly off the event loop, matching
+            # the AsyncSessionStore boundary used by every other async path.
+            with self.session_store._lock:  # noqa: SLF001
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
+                return [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
@@ -12160,6 +12185,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
                 ]
+
+        try:
+            candidates = await asyncio.to_thread(_snapshot_resume_candidates)
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
@@ -17144,11 +17172,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if queue_during_drain
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-                )
+                    return None
+                return self._drain_rejection_message()
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -17731,7 +17756,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return self._drain_rejection_message()
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -19016,6 +19041,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"{start_context}\n\n{existing}"
                             if existing else str(start_context)
                         )
+
+        # A restart can land after the transport accepted a message but before
+        # the session transcript committed it. Re-read a bounded, adapter-
+        # fenced tail so quiet recovery can decide where to pick up without
+        # guessing across chats or threads.
+        _resume_transport_context = ""
+        if getattr(session_entry, "resume_pending", False):
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                try:
+                    _resume_transport_context = str(
+                        await adapter.session_resume_context(source) or ""
+                    )
+                except Exception:
+                    logger.warning(
+                        "Platform session-resume context hook failed "
+                        "category=adapter_exception"
+                    )
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -20217,6 +20260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                resume_context=_resume_transport_context,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -24260,7 +24304,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await transport.send(
                 platform,
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                "I’m back.",
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -24301,7 +24345,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = "I’m back online."
 
         for platform, platform_cfg in self.config.platforms.items():
             home = platform_cfg.home_channel
@@ -27928,6 +27972,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        resume_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -27948,6 +27993,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                resume_context=resume_context,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -27961,6 +28007,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                resume_context=resume_context,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28104,6 +28151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        resume_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28389,6 +28437,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cleanup_progress=_cleanup_progress,
             _cleanup_msg_ids=_cleanup_msg_ids,
             message=message,
+            resume_context=resume_context,
             AIAgent=AIAgent,
             resolve_display_setting=resolve_display_setting,
             user_config=user_config,

@@ -649,12 +649,11 @@ class PlatformConfig:
     # - "all": All chunks in multi-part replies thread to user's message
     reply_to_mode: str = "first"
 
-    # Whether the gateway is allowed to send "♻️ Gateway online" /
-    # "♻ Gateway restarted" lifecycle notifications on this platform.
-    # Default True preserves prior behavior. Set False on platforms used
-    # by end users (e.g. Slack) where operator-flavored restart pings are
-    # noise; keep True for back-channels where the operator wants them.
-    gateway_restart_notification: bool = True
+    # Whether the gateway may send explicit shutdown/startup lifecycle
+    # notifications on this platform. They are silent by default: durable
+    # recovery should make a routine restart invisible to end users. Operators
+    # can opt in on a private back-channel when the plumbing itself is useful.
+    gateway_restart_notification: bool = False
 
     # Whether the gateway shows a "typing…" / "is thinking…" status indicator
     # while the agent processes a message on this platform. Default True
@@ -744,7 +743,7 @@ class PlatformConfig:
             api_key=data.get("api_key"),
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
-            gateway_restart_notification=_coerce_bool(_grn, True),
+            gateway_restart_notification=_coerce_bool(_grn, False),
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
             channel_overrides=channel_overrides,

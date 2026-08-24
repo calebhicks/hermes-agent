@@ -52,7 +52,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     )
 
     result = await runner._handle_restart_command(event)
-    assert "Restarting" in result
+    assert "right back" in result
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
@@ -198,7 +198,7 @@ async def test_send_home_channel_startup_notification_preserves_thread_metadata(
     assert delivered == {("telegram", "parent-42", "777")}
     adapter.send.assert_called_once_with(
         "parent-42",
-        "♻️ Gateway online — Hermes is back and ready.",
+        "I’m back online.",
         metadata={
             "thread_id": "777",
             "telegram_dm_topic_reply_fallback": True,
@@ -220,6 +220,7 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
         Platform.RELAY: PlatformConfig(enabled=True),
         Platform.SLACK: PlatformConfig(
             enabled=False,
+            gateway_restart_notification=True,
             home_channel=HomeChannel(
                 platform=Platform.SLACK,
                 chat_id="D123",
@@ -237,7 +238,7 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
     assert relay.send_for_platform.await_args.args[:3] == (
         Platform.SLACK,
         "D123",
-        "♻️ Gateway online — Hermes is back and ready.",
+        "I’m back online.",
     )
     assert relay.send_for_platform.await_args.kwargs["metadata"]["user_id"] == "U123"
     assert relay.send_for_platform.await_args.kwargs["metadata"]["scope_id"] == "T123"
@@ -272,7 +273,9 @@ async def test_relay_restart_notification_uses_logical_platform_and_owner(tmp_pa
     runner.adapters = {Platform.RELAY: relay}
     runner.config.platforms = {
         Platform.RELAY: PlatformConfig(enabled=True),
-        Platform.SLACK: PlatformConfig(enabled=False),
+        Platform.SLACK: PlatformConfig(
+            enabled=False, gateway_restart_notification=True
+        ),
     }
 
     delivered_target = await runner._send_restart_notification()
@@ -387,7 +390,7 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
     adapter.send.assert_awaited_once_with(
         "parent-42",
-        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        "I’m going offline, so I have to stop this for now.",
         metadata={"thread_id": "topic-7"},
     )
 
@@ -411,5 +414,3 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     await runner._notify_active_sessions_of_shutdown()
 
     adapter.send.assert_not_awaited()
-
-

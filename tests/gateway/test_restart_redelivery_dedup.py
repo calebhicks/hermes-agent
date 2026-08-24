@@ -71,7 +71,7 @@ async def test_stale_marker_older_than_5min_does_not_block(tmp_path, monkeypatch
     event = _make_restart_event(update_id=12345)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert "right back" in result
     runner.request_restart.assert_called_once()
 
 
@@ -95,7 +95,7 @@ async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
     event = _make_restart_event(update_id=None)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert "right back" in result
     runner.request_restart.assert_called_once()
 
 
@@ -134,7 +134,7 @@ async def test_different_platform_bypasses_dedup(tmp_path, monkeypatch):
     )
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert "right back" in result
     runner.request_restart.assert_called_once()
 
 
@@ -162,5 +162,4 @@ async def test_marker_missing_but_booted_from_restart_ignores_redelivery(tmp_pat
     runner.request_restart.assert_not_called()
     # One-shot: the flag is consumed so a later legitimate /restart is honored.
     assert runner._booted_from_restart is False
-
 

@@ -51,7 +51,7 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     # sides of the equality above would still match. Assert on the catalog
     # output explicitly so a broken locale resolution fails loudly here.
     assert expected != "gateway.draining"
-    assert "Draining" in expected and "1" in expected
+    assert "finishing" in expected and "1" in expected
     running_agent.interrupt.assert_not_called()
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
@@ -339,6 +339,55 @@ async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
 
 
 @pytest.mark.asyncio
+async def test_restart_drain_silently_queues_a_retained_message():
+    runner, adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = True
+    runner._busy_input_mode = "queue"
+    adapter._send_with_retry = AsyncMock()
+    event = MessageEvent(
+        text="keep this",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m-queued",
+    )
+    session_key = build_session_key(event.source)
+
+    handled = await runner._handle_active_session_busy_message(event, session_key)
+
+    assert handled is True
+    assert adapter._pending_messages[session_key] is event
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_restart_drain_only_speaks_when_message_cannot_be_retained():
+    runner, adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = True
+    runner._busy_input_mode = "interrupt"
+    adapter._send_with_retry = AsyncMock()
+    event = MessageEvent(
+        text="cannot keep this",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m-retry",
+    )
+
+    handled = await runner._handle_active_session_busy_message(
+        event, build_session_key(event.source)
+    )
+
+    assert handled is True
+    content = adapter._send_with_retry.await_args.kwargs["content"]
+    assert content == (
+        "I’m restarting for a moment and couldn’t save this message. "
+        "Please send it again shortly."
+    )
+    assert "gateway" not in content.lower()
+
+
+@pytest.mark.asyncio
 async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, monkeypatch):
     """A suppress_notification drain marker mutes ONLY the home-channel broadcast.
 
@@ -372,7 +421,7 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
     sent_chat_ids = {chat_id for chat_id, _content, _meta in adapter.sent_calls}
     assert "999" in sent_chat_ids
     assert "home-42" not in sent_chat_ids
-    assert "shutting down" in adapter.sent[0]
+    assert adapter.sent[0] == "I’m going offline, so I have to stop this for now."
 
 
 

@@ -2985,18 +2985,11 @@ class BasePlatformAdapter(ABC):
     # generic seam; Slack is merely the first consumer).
     supports_inchannel_continuable: bool = False
 
-    # Whether a human is interactively present on this platform to answer a
-    # "session restored — what next?" prompt.  The startup auto-resume turn
-    # (``_schedule_resume_pending_sessions`` → the ``_is_resume_pending``
-    # branch in ``_handle_message_with_agent``) reads this to pick its
-    # guidance: interactive platforms (Telegram, Slack, Discord DMs, …) get
-    # "report the restore and ask what the user wants next"; non-interactive
-    # event platforms (webhook) get "finish the interrupted work" because
-    # nobody is there to answer, and an acknowledgement would silently
-    # abandon the task (#57056).  Read generically via ``getattr(adapter,
-    # "interactive_resume", True)`` — no per-platform branching at the call
-    # site.
-    interactive_resume: bool = True
+    # Startup recovery quietly continues interrupted work by default. An
+    # adapter may opt into the older "report the restore and ask what next"
+    # behavior for a private operator surface, but ordinary human channels
+    # should not expose gateway lifecycle plumbing.
+    interactive_resume: bool = False
 
     # Back-reference to the running ``GatewayRunner``, injected by
     # ``gateway/run.py`` after the adapter is created. Adapters consume it via
@@ -7140,6 +7133,16 @@ class BasePlatformAdapter(ABC):
         Failure is non-fatal and produces no context.
         """
         del event
+        return None
+
+    async def session_resume_context(self, source: SessionSource) -> Optional[str]:
+        """Return bounded transport context for an interrupted-session resume.
+
+        This runs only after the current adapter has re-authorized a persisted
+        source. It covers the crash window between transport receipt and
+        durable session persistence; failure never blocks transcript recovery.
+        """
+        del source
         return None
     
     def build_source(

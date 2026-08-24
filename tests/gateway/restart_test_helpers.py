@@ -15,7 +15,14 @@ from gateway.session import SessionSource
 
 class RestartTestAdapter(BasePlatformAdapter):
     def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+        super().__init__(
+            PlatformConfig(
+                enabled=True,
+                token="***",
+                gateway_restart_notification=True,
+            ),
+            Platform.TELEGRAM,
+        )
         self.sent: list[str] = []
         self.sent_calls: list[tuple[str, str, object]] = []
 
@@ -56,7 +63,13 @@ def make_restart_runner(
 ) -> tuple[GatewayRunner, BasePlatformAdapter]:
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                gateway_restart_notification=True,
+            )
+        }
     )
     runner._running = True
     runner._shutdown_event = asyncio.Event()

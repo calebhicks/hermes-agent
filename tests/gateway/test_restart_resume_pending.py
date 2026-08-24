@@ -314,6 +314,28 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
+    def test_default_resume_is_quiet_and_includes_recent_transport_context(self):
+        note = build_resume_recovery_note(
+            "restart_interrupted",
+            "",
+            recent_context=(
+                "[Recent local Messages context for recovery]\n"
+                "Colton: Can Donna take this one?"
+            ),
+        )
+        assert "CONTINUE the interrupted task" in note
+        assert "Report to the user" not in note
+        assert "Colton: Can Donna take this one?" in note
+
+    def test_new_message_remains_distinct_from_recent_recovery_context(self):
+        note = build_resume_recovery_note(
+            "restart_timeout",
+            "Please finish the draft",
+            recent_context="Donna: I started the draft",
+        )
+        assert note.index("Donna: I started the draft") < note.index("[New message]")
+        assert note.endswith("Please finish the draft")
+
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
         """The auto-resume note must not leave an empty row in state.db."""
@@ -783,8 +805,8 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "I need to restart for a moment, so I’m pausing this. "
+        "I’ll pick it back up when I’m back."
     ]
 
 

@@ -83,6 +83,10 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict(pc.to_dict())
         assert restored.gateway_restart_notification is False
 
+    def test_gateway_restart_notification_defaults_silent(self):
+        assert PlatformConfig().gateway_restart_notification is False
+        assert PlatformConfig.from_dict({}).gateway_restart_notification is False
+
 
     def test_typing_status_text_resolved_from_extra(self):
         # Same bridge route as typing_indicator: the shared-key loop copies a

@@ -76,6 +76,7 @@ class TurnContext:
 
     # --- the ex-``nonlocal`` turn message (rebindable) --------------------
     message: Optional[str] = None
+    resume_context: Optional[str] = None
 
     # --- turn parameters / config snapshots (read-only in run_sync) -------
     history: Any = None
