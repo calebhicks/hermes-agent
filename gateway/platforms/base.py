@@ -4136,6 +4136,11 @@ class BasePlatformAdapter(ABC):
         del source
         return None
 
+    def is_group_sender_allowed(self, chat_id: str, user_id: str) -> bool:
+        """Re-check one adapter-owned room/sender allowlist at gateway auth."""
+        del chat_id, user_id
+        return False
+
     async def authorize_persisted_source(self, source: SessionSource) -> Optional[bool]:
         """Re-authorize a serialized source before restart auto-resume."""
         del source

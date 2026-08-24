@@ -529,6 +529,20 @@ class GatewayAuthorizationMixin:
         adapter_profile = self._adapter_profile_for_source(source)
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
+        if (
+            is_group
+            and source.chat_id
+            and self._adapter_flag(source.platform, "enforces_own_access_policy", adapter_profile)
+            and self._adapter_policy(source.platform, "group", adapter_profile) == "allowlist"
+            and self._adapter_group_has_sender_allowlist(
+                source.platform, source.chat_id, profile=adapter_profile
+            )
+        ):
+            adapter = self._authorization_adapter(source.platform, adapter_profile)
+            sender_check = getattr(adapter, "is_group_sender_allowed", None)
+            if callable(sender_check):
+                return bool(sender_check(source.chat_id, source.user_id))
+            return False
         if self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation):
             return True
         user_id = source.user_id
