@@ -37,6 +37,10 @@ def send_message_tool(args, **kw):
         return _handle_list()
     if action in ("react", "unreact"):
         return _handle_react(args, remove=action == "unreact")
+    if action == "edit":
+        return _handle_repair(args, undo=False)
+    if action == "undo_send":
+        return _handle_repair(args, undo=True)
     return _handle_send(args)
 
 
@@ -196,6 +200,96 @@ def _handle_react(args, remove=False):
         result = _run_async(react_fn(chat_id=chat_id, message_id=message_id, **({} if remove else {"emoji": emoji})))
     except Exception as e:
         return json.dumps(_error(f"Reaction failed: {e}"))
+    return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
+
+
+def _handle_repair(args, *, undo: bool):
+    """Dispatch an exact-target iMessage repair under the live turn envelope."""
+    target = str(args.get("target") or "").strip()
+    message_id = str(args.get("message_id") or "").strip()
+    replacement = args.get("message")
+    if not target or ":" not in target or not message_id:
+        return tool_error(
+            "Exact 'target' and 'message_id' are required for iMessage repair."
+        )
+    if not undo and (not isinstance(replacement, str) or not replacement):
+        return tool_error("'message' is required when action='edit'.")
+
+    platform_name, target_ref = target.split(":", 1)
+    platform_name = platform_name.strip().lower()
+    target_ref = target_ref.strip()
+    if platform_name != "imessage" or not target_ref:
+        return tool_error("edit and undo_send are available only for iMessage.")
+    prepare_send_message_platforms()
+    chat_id, _thread_id, resolution_error = resolve_send_target(
+        platform_name, target_ref
+    )
+    if resolution_error or not chat_id:
+        return tool_error(resolution_error or "Could not resolve exact iMessage target.")
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+
+        platform = Platform(platform_name)
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(platform) if runner is not None else None
+    except Exception:
+        adapter = None
+    if adapter is None:
+        return tool_error(
+            "iMessage repair requires the live gateway adapter; cron and standalone contexts are refused."
+        )
+
+    try:
+        from agent.delegation_context import is_delegated_child_context
+        from gateway.session_context import get_session_env
+
+        authority = {
+            "source": get_session_env("HERMES_SESSION_SOURCE", ""),
+            "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+            "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+            "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE", ""),
+            "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+            "delegated": bool(is_delegated_child_context()),
+            "cron": get_session_env("HERMES_CRON_SESSION", "") == "1",
+        }
+    except Exception:
+        authority = {}
+
+    fn_name = "undo_message" if undo else "edit_message"
+    repair_fn = getattr(adapter, fn_name, None)
+    if not callable(repair_fn):
+        return tool_error("The live iMessage adapter does not support repair controls.")
+
+    async def invoke():
+        if undo:
+            return await repair_fn(
+                chat_id=chat_id,
+                message_id=message_id,
+                authority=authority,
+            )
+        return await repair_fn(
+            chat_id=chat_id,
+            message_id=message_id,
+            message=replacement,
+            authority=authority,
+        )
+
+    try:
+        from model_tools import _run_async
+
+        result = _run_async(asyncio.wait_for(invoke(), timeout=70.0))
+    except asyncio.TimeoutError:
+        return json.dumps({
+            "success": False,
+            "delivery": "mutation_uncertain",
+            "operation": "undo_send" if undo else "edit",
+            "category": "provider_timeout",
+            "error": "Repair timed out after dispatch; do not retry.",
+        })
+    except Exception:
+        return json.dumps(_error("iMessage repair failed before readback."))
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 
@@ -665,8 +759,8 @@ SEND_MESSAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["send", "list", "react", "unreact"],
-                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+                "enum": ["send", "list", "react", "unreact", "edit", "undo_send"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns available targets. 'react'/'unreact' manage a targeted reaction. 'edit' and 'undo_send' are owner-authorized iMessage repair controls and always require an exact message id."
             },
             "target": {
                 "type": "string",
@@ -674,7 +768,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
+                "description": "The message text to send, or the replacement text for action='edit'. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
             },
             "emoji": {
                 "type": "string",
@@ -682,7 +776,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message_id": {
                 "type": "string",
-                "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+                "description": "Exact message id for react/unreact/edit/undo_send. Required for edit and undo_send; iMessage reactions also require it and never infer latest."
             }
         },
         "required": []

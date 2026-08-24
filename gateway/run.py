@@ -4168,6 +4168,7 @@ class GatewayRunner(
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
+            source=str(getattr(context, "turn_source", "") or ""),
             chat_id=context.source.chat_id,
             chat_type=str(context.source.chat_type) if context.source.chat_type else "",
             chat_name=context.source.chat_name or "",

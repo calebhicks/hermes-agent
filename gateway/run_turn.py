@@ -1867,6 +1867,14 @@ class GatewayTurnMixin:
                         "Platform session-resume context hook failed category=adapter_exception"
                     )
         context = build_session_context(source, self.config, session_entry)
+        # Carry provenance on this turn's private SessionContext so the
+        # existing _set_session_env(context) boundary stays compatible with
+        # adapters/tests that wrap it. Missing provenance fails closed.
+        context.turn_source = (
+            "gateway_internal"
+            if bool(getattr(event, "internal", False))
+            else "gateway_inbound"
+        )
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
