@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -1246,28 +1247,49 @@ def _live_send_text(
         platform=t.platform, chat_id=str(t.chat_id), thread_id=route_thread_id, is_explicit=True)
     # Thread routing goes via the target, not a bare metadata "thread_id": the router only applies
     # its Telegram DM-topic detection when thread_id/message_thread_id are absent from metadata.
+    # future.cancel() returning True does not prove the coroutine never ran: an asyncio task
+    # suspended between per-bubble sends can still cancel after part of the payload is on the wire.
+    delivery_started = threading.Event()
+
+    async def _tracked_delivery(
+        _target=route_target,
+        _text=text_to_send,
+        _metadata=route_metadata,
+        _started=delivery_started,
+    ):
+        _started.set()
+        return await router._deliver_to_platform(_target, _text, _metadata)
+
     future = safe_schedule_threadsafe(
-        router._deliver_to_platform(route_target, text_to_send, route_metadata), t.loop)
+        _tracked_delivery(), t.loop)
     if future is None:
         target_errors.append("live adapter event loop scheduling failed")
         return False, False, None
+    send_timeout = min(300, 60 + 30 * (len(text_to_send) // 800))
     try:
-        send_result = future.result(timeout=60)
+        send_result = future.result(timeout=send_timeout)
     except TimeoutError:
-        # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
-        # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
-        # started (loop wedged): MUST fall through to standalone or it is silently dropped.
-        if future.cancel():
+        # Slow confirmation != failure. Only a provably never-started coroutine is cancelled and
+        # retried standalone; once delivery entered the coroutine, it may already have mutated the
+        # provider and must be left running to avoid truncation or duplicate fallback delivery.
+        if delivery_started.is_set():
+            logger.warning(
+                "Job '%s': live adapter send to %s:%s did not confirm within %ss but "
+                "delivery already started; leaving it running and assuming delivered "
+                "(no cancel, no standalone fallback)",
+                job["id"], t.platform_name, t.chat_id, send_timeout)
+            return True, True, None
+        if future.cancel() and not delivery_started.is_set():
             msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
             logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
             target_errors.append(msg)
             return False, False, None
         logger.warning(
             "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
+            "after %ss; already dispatched (in flight), "
             "assuming delivered (skipping standalone fallback "
             "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
+            job["id"], t.platform_name, t.chat_id, send_timeout)
         return True, True, None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone.
