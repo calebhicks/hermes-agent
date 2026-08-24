@@ -354,6 +354,21 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+
+def kanban_worker_guidance(valid_tool_names) -> str:
+    """Return worker lifecycle guidance only for a task-bound process.
+
+    Orchestrator profiles may expose ``kanban_show`` in ordinary interactive
+    sessions. Tool presence therefore proves capability, not worker identity;
+    the dispatcher-owned task marker is the positive activation signal.
+    """
+    return (
+        KANBAN_GUIDANCE
+        if os.environ.get("HERMES_KANBAN_TASK")
+        and "kanban_show" in valid_tool_names
+        else ""
+    )
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

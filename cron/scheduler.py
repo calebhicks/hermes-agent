@@ -1761,7 +1761,13 @@ def _open_continuable_cron_thread(
     if not callable(create_thread) or loop is None:
         return None
     task_name = job.get("name") or job.get("id", "cron")
-    thread_name = f"Hermes — {task_name}"
+    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+    requested_title = origin.get("thread_title")
+    thread_name = (
+        requested_title.strip()
+        if isinstance(requested_title, str) and requested_title.strip()
+        else f"Hermes — {task_name}"
+    )
     try:
         from agent.async_utils import safe_schedule_threadsafe
 

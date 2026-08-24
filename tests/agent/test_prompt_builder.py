@@ -794,6 +794,71 @@ class TestEnvironmentHints:
         assert "Terminal backend: docker" in result
         assert "inside" in result.lower()
 
+
+class TestKanbanWorkerGuidance:
+    def test_interactive_orchestrator_does_not_receive_worker_protocol(self, monkeypatch):
+        from agent.prompt_builder import kanban_worker_guidance
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        assert kanban_worker_guidance({"kanban_show", "kanban_list"}) == ""
+
+    def test_task_bound_worker_receives_worker_protocol(self, monkeypatch):
+        from agent.prompt_builder import KANBAN_GUIDANCE, kanban_worker_guidance
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bound")
+        assert kanban_worker_guidance({"kanban_show"}) == KANBAN_GUIDANCE
+
+    def test_task_marker_without_worker_tool_does_not_receive_protocol(self, monkeypatch):
+        from agent.prompt_builder import kanban_worker_guidance
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bound")
+        assert kanban_worker_guidance({"kanban_list"}) == ""
+
+    def test_empty_task_marker_does_not_activate_worker_protocol(self, monkeypatch):
+        """A cleared/blank marker is not a task binding — the dispatcher sets a
+        real task id. Regression for the interactive-lane misfire."""
+        from agent.prompt_builder import kanban_worker_guidance
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "")
+        assert kanban_worker_guidance({"kanban_show"}) == ""
+
+    def test_system_prompt_omits_worker_protocol_in_interactive_lane(self, monkeypatch):
+        """End-to-end: the assembled prompt must not carry worker lifecycle text
+        just because an orchestrator profile exposes kanban_show."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from agent import system_prompt as system_prompt_module
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        agent = SimpleNamespace(
+            valid_tool_names={"kanban_show", "kanban_list"},
+            _kanban_worker_guidance=None,
+            load_soul_identity=False,
+            skip_context_files=True,
+            _task_completion_guidance=False,
+            _parallel_tool_call_guidance=False,
+            _tool_use_enforcement=False,
+            _environment_probe=False,
+            _memory_store=None,
+            _memory_manager=None,
+            _plugin_system_prompt_sections_snapshot=(),
+            model="",
+            provider="",
+            platform="",
+            pass_session_id=False,
+            session_id="",
+        )
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+        ):
+            stable = system_prompt_module.build_system_prompt_parts(agent)["stable"]
+
+        assert KANBAN_GUIDANCE not in stable
+
     def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()
         (the daemon launch dir). Regression for #24882/#24969/#27383/#29265."""
@@ -1056,5 +1121,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

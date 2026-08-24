@@ -36,7 +36,7 @@ from agent.prompt_builder import (
     EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
-    KANBAN_GUIDANCE,
+    kanban_worker_guidance,
     MEMORY_GUIDANCE,
     USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -435,16 +435,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Kanban worker/orchestrator lifecycle — only present when the
-    # dispatcher spawned this process (kanban_show check_fn gates on
-    # HERMES_KANBAN_TASK env var). Normal chat sessions never see
-    # this block. Resolved once at __init__ (see _kanban_worker_guidance).
+    # Kanban worker lifecycle — only when the dispatcher bound this process to
+    # a task (HERMES_KANBAN_TASK) AND the worker tool is loaded. Orchestrator
+    # profiles may expose kanban_show interactively, so the tool alone is not
+    # evidence of a worker run. Resolved once at __init__.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
+    elif _kanban_guidance is None:
         # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
+        _fallback_guidance = kanban_worker_guidance(agent.valid_tool_names)
+        if _fallback_guidance:
+            tool_guidance.append(_fallback_guidance)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
