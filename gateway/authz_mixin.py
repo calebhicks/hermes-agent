@@ -410,6 +410,32 @@ class GatewayAuthorizationMixin:
 
         adapter_profile = self._adapter_profile_for_source(source)
 
+        # A platform may have a scalar direct-message environment allowlist
+        # and a separate, adapter-owned per-room sender allowlist. Honor the
+        # latter before the scalar env path double-denies a validated group.
+        # Re-run the sender check here so a crafted SessionSource cannot turn
+        # "this room has an allowlist" into access.
+        if (
+            source.chat_type in {"group", "forum", "channel"}
+            and source.chat_id
+            and self._adapter_enforces_own_access_policy(
+                source.platform, profile=adapter_profile
+            )
+            and self._adapter_group_policy(
+                source.platform, profile=adapter_profile
+            ) == "allowlist"
+            and self._adapter_group_has_sender_allowlist(
+                source.platform, source.chat_id, profile=adapter_profile
+            )
+        ):
+            adapter = self._authorization_adapter(
+                source.platform, adapter_profile
+            )
+            sender_check = getattr(adapter, "is_group_sender_allowed", None)
+            if callable(sender_check):
+                return bool(sender_check(source.chat_id, source.user_id))
+            return False
+
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
         # gateway's WS with a per-instance secret and resolves owner-only author
