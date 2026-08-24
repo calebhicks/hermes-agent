@@ -235,6 +235,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
     adapter.send.assert_awaited_once_with(
         "chat-1",
         "Quote here",
+        reply_to=event.message_id,
         metadata={"thread_id": "topic-1"},
     )
     adapter.send_multiple_images.assert_awaited_once_with(
@@ -285,6 +286,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
     adapter.send.assert_awaited_once_with(
         "chat-1",
         "Threaded image",
+        reply_to=event.message_id,
         metadata=routing_metadata,
     )
     adapter.send_multiple_images.assert_awaited_once_with(
@@ -326,6 +328,7 @@ async def test_queued_followup_delivery_keeps_remote_image_url_in_text():
     adapter.send.assert_awaited_once_with(
         "chat-1",
         response,
+        reply_to=event.message_id,
         metadata={"thread_id": "topic-1"},
     )
     adapter.send_multiple_images.assert_not_awaited()
@@ -369,6 +372,7 @@ async def test_queued_followup_delivery_keeps_bare_local_path_in_text(
     adapter.send.assert_awaited_once_with(
         "chat-1",
         response,
+        reply_to=event.message_id,
         metadata={"thread_id": "topic-1"},
     )
     adapter.send_multiple_images.assert_not_awaited()
@@ -408,6 +412,7 @@ async def test_queued_followup_delivery_preserves_protected_media_example():
     adapter.send.assert_awaited_once_with(
         "chat-1",
         response,
+        reply_to=event.message_id,
         metadata={"thread_id": "topic-1"},
     )
     adapter.send_multiple_images.assert_not_awaited()

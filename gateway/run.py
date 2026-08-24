@@ -9658,8 +9658,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return name or None
 
     def _effective_busy_input_mode(self, source: SessionSource) -> str:
-        """Resolve busy input mode from the routed profile startup snapshot."""
+        """Resolve adapter source override, then routed-profile snapshot."""
         fallback = getattr(self, "_busy_input_mode", "interrupt")
+        adapter = self._adapter_for_source(source)
+        if adapter is not None:
+            try:
+                override = adapter.busy_input_mode_for_source(source)
+            except Exception:
+                logger.warning(
+                    "Platform busy-input source hook failed category=adapter_exception"
+                )
+            else:
+                if override in {"interrupt", "queue", "steer"}:
+                    return override
+                if override is not None:
+                    logger.warning(
+                        "Platform busy-input source hook failed category=invalid_result"
+                    )
         profile_name = self._busy_profile_name_for_source(source)
         if not profile_name:
             return fallback
@@ -12110,7 +12125,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+    async def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
         ``resume_pending`` already preserves the transcript AND the existing
@@ -12193,24 +12208,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            # Validate the session owner against the current allowlist
-            # before auto-resuming. A session created before
-            # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
-            # before the owner was removed from it, must not silently
-            # receive a full agent response on gateway restart just
-            # because it has a resume-pending marker (issue #23778).
+            # Re-authorize persisted sources only after the current adapter is
+            # connected. Adapter decisions are authoritative because some
+            # platforms validate structured room membership that cannot be
+            # represented by the generic scalar owner allowlist. ``None``
+            # preserves the established generic check. Hook exceptions deny.
             try:
-                if not self._is_user_authorized(source):
+                adapter_decision = await adapter.authorize_persisted_source(source)
+            except Exception:
+                logger.warning(
+                    "Skipping auto-resume for %s: adapter authorization hook "
+                    "failed category=adapter_exception",
+                    entry.session_key,
+                )
+                continue
+            try:
+                authorized = (
+                    self._is_user_authorized(source)
+                    if adapter_decision is None
+                    else bool(adapter_decision)
+                )
+                if not authorized:
                     logger.warning(
-                        "Skipping auto-resume for %s: session owner is no "
-                        "longer authorized under the current allowlist",
+                        "Skipping auto-resume for %s: persisted source is no "
+                        "longer authorized",
                         entry.session_key,
                     )
                     continue
             except Exception as exc:
                 logger.warning(
-                    "Skipping auto-resume for %s: authorization check failed: %s",
-                    entry.session_key, exc,
+                    "Skipping auto-resume for %s: authorization check failed "
+                    "category=gateway_exception",
+                    entry.session_key,
                 )
                 continue
 
@@ -13231,7 +13260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
-        self._schedule_resume_pending_sessions()
+        await self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
         # Surface state.db init failures to the user's messaging platforms
@@ -14360,7 +14389,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # auto-resume scoped to this platform so recovery
                         # doesn't silently wait for a manual user message.
                         try:
-                            self._schedule_resume_pending_sessions(platform=platform)
+                            await self._schedule_resume_pending_sessions(platform=platform)
                         except Exception:
                             logger.debug(
                                 "resume-pending reschedule after %s reconnect failed",
@@ -18971,6 +19000,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                try:
+                    start_context = await adapter.session_start_context(event)
+                except Exception:
+                    logger.warning(
+                        "Platform session-start context hook failed "
+                        "category=adapter_exception"
+                    )
+                else:
+                    if start_context:
+                        existing = str(getattr(event, "channel_context", "") or "")
+                        event.channel_context = (
+                            f"{start_context}\n\n{existing}"
+                            if existing else str(start_context)
+                        )
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -22345,6 +22390,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await adapter.send(
                         source.chat_id,
                         text_content,
+                        reply_to=event_message_id,
                         metadata=metadata,
                     )
 

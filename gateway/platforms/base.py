@@ -7106,6 +7106,36 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
+
+    def busy_input_mode_for_source(self, source: SessionSource) -> Optional[str]:
+        """Optionally override busy input semantics for one source.
+
+        Adapters may return ``queue``, ``interrupt``, or ``steer``. ``None``
+        preserves the profile-wide policy. The gateway validates the value so
+        an adapter typo can never silently select a new behavior.
+        """
+        del source
+        return None
+
+    async def authorize_persisted_source(
+        self, source: SessionSource
+    ) -> Optional[bool]:
+        """Re-authorize a serialized source before restart auto-resume.
+
+        ``None`` delegates to the gateway allowlist. A boolean is an
+        authoritative adapter decision; exceptions fail closed in the runner.
+        """
+        del source
+        return None
+
+    async def session_start_context(self, event: MessageEvent) -> Optional[str]:
+        """Return adapter context for an actually new/reset session.
+
+        This runs after session resolution and before inbound preprocessing.
+        Failure is non-fatal and produces no context.
+        """
+        del event
+        return None
     
     def build_source(
         self,
