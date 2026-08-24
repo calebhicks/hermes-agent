@@ -19069,6 +19069,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
+        # Carry provenance on this turn's private SessionContext so the
+        # existing _set_session_env(context) boundary stays compatible with
+        # adapters/tests that wrap it. Missing provenance fails closed.
+        context.turn_source = (
+            "gateway_internal"
+            if bool(getattr(event, "internal", False))
+            else "gateway_inbound"
+        )
         _session_env_tokens = self._set_session_env(context)
         
         # Read privacy.redact_pii from config (re-read per message)
@@ -24525,6 +24533,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
+            source=str(getattr(context, "turn_source", "") or ""),
             chat_id=context.source.chat_id,
             chat_type=(
                 str(context.source.chat_type) if context.source.chat_type else ""
