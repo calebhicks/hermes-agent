@@ -1019,14 +1019,12 @@ def _is_fresh_gateway_interruption(
 
 
 def build_resume_recovery_note(
-    reason: Optional[str], message: str = "", *, interactive: bool = True) -> str:
+    reason: Optional[str], message: str = "", *, interactive: bool = False,
+    recent_context: str = "") -> str:
     """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
 
-    Interactive platforms report the restore and ask what next; non-interactive ones finish the work.
-
-    On non-interactive event platforms (webhook, API server — adapters with ``interactive_resume = False``)
-    nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
-    abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
+    ``interactive`` is an explicit opt-in to the older "report the restore and
+    ask what next" behavior. The default quietly completes interrupted work.
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
@@ -1053,16 +1051,22 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-run tool calls whose results already "
             "appear in the history — resume from the first step that has no recorded result.")
-    return (
+    note = (
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "
         f"Any restart/shutdown command in the history has already "
         f"run — do NOT re-execute or verify it. {resume_guidance} {tail_guidance}]"
-        + (f"\n\n{message}" if message else ""))
+    )
+    if recent_context:
+        note += f"\n\n{recent_context}"
+    if message:
+        note += f"\n\n[New message]\n{message}"
+    return note
 
 
 def _prepare_resume_pending_message(
-    reason: Optional[str], message: Optional[str], *, interactive: bool = True) -> tuple[str, str]:
+    reason: Optional[str], message: Optional[str], *, interactive: bool = True,
+    recent_context: str = "") -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
     Empty original: persist the note (a "" user row trips the pre-call sanitizer). Real text: persist clean.
@@ -1074,7 +1078,8 @@ def _prepare_resume_pending_message(
     words: the transcript stays scaffold-free (the model still receives the wrapped note), and a non-empty
     row never trips the sanitizer.
     """
-    recovery_message = build_resume_recovery_note(reason, message or "", interactive=interactive)
+    recovery_message = build_resume_recovery_note(
+        reason, message or "", interactive=interactive, recent_context=recent_context)
     persist_message = message if isinstance(message, str) and message.strip() else recovery_message
     return recovery_message, persist_message
 
@@ -3880,6 +3885,14 @@ class GatewayRunner(
 
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
+
+    def _drain_rejection_message(self) -> str:
+        if self._restart_requested:
+            return (
+                "I’m restarting for a moment and couldn’t save this message. "
+                "Please send it again shortly."
+            )
+        return "I’m going offline and couldn’t save this message. Please send it again when I’m back."
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         _write_runtime_status_quiet(

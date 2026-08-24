@@ -1815,15 +1815,9 @@ class BasePlatformAdapter(ABC):
     # the whole-channel bucket ``(platform, chat_id, None)``; needs a flat-reply outbound gate too
     # (Slack ``reply_in_thread: false``). False fails SAFE -> ``thread``.
     supports_inchannel_continuable: bool = False
-    # A human can answer "session restored — what next?"; webhook-style platforms set False so
-    # auto-resume finishes the work instead of asking nobody.
-    # The startup auto-resume turn (``_schedule_resume_pending_sessions`` → the ``_is_resume_pending``
-    # branch in ``_handle_message_with_agent``) reads this to pick its guidance: interactive platforms
-    # (Telegram, Slack, Discord DMs, …) get "report the restore and ask what the user wants next";
-    # non-interactive event platforms (webhook) get "finish the interrupted work" because nobody is there to
-    # answer, and an acknowledgement would silently abandon the task (#57056). Read generically via
-    # ``getattr(adapter, "interactive_resume", True)`` — no per-platform branching at the call site.
-    interactive_resume: bool = True
+    # Startup recovery quietly continues interrupted work by default. An adapter may opt into the
+    # older "report the restore and ask what next" behavior for a private operator surface.
+    interactive_resume: bool = False
     # Back-reference to the running ``GatewayRunner`` (set by gateway/run.py); ``build_source``
     # resolves the inbound profile via ``runner._profile_name_for_source``.
     gateway_runner = None  # type: ignore[assignment]
@@ -4149,6 +4143,11 @@ class BasePlatformAdapter(ABC):
     async def session_start_context(self, event: MessageEvent) -> Optional[str]:
         """Return adapter context for an actually new/reset session."""
         del event
+        return None
+
+    async def session_resume_context(self, source: SessionSource) -> Optional[str]:
+        """Return bounded transport context for an interrupted-session resume."""
+        del source
         return None
 
     def build_source(

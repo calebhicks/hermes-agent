@@ -536,7 +536,7 @@ class GatewayStartupMixin:
         sessions with a running agent are skipped so none is resumed twice."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
         window = _auto_continue_freshness_window()
-        candidates = self._resume_pending_candidates(platform)
+        candidates = await asyncio.to_thread(self._resume_pending_candidates, platform)
         if candidates is None:
             return 0
         now = datetime.now()

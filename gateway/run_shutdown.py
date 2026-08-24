@@ -935,12 +935,9 @@ class GatewayShutdownMixin:
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
         """
         restart_source = self._restart_command_source if self._restart_requested else None
-        msg = "⚠️ Gateway shutting down — Your current task will be interrupted."
+        msg = "I’m going offline, so I have to stop this for now."
         if self._restart_requested:
-            msg = (
-                "⚠️ Gateway restarting — Your current task will be interrupted. "
-                "Send any message after restart and I'll try to resume where you left off."
-            )
+            msg = "I need to restart for a moment, so I’m pausing this. I’ll pick it back up when I’m back."
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):

@@ -390,7 +390,7 @@ class PlatformConfig:
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
     reply_to_mode: str = "first"  # "off" never threads, "first" only the first chunk, "all" every chunk
-    gateway_restart_notification: bool = True  # "♻️ Gateway online/restarted" pings; noise on end-user platforms
+    gateway_restart_notification: bool = False  # lifecycle pings are opt-in noise on end-user platforms
     typing_indicator: bool = True  # drives _keep_typing; False where unwanted (Slack setStatus blocks compose)
     # Working-state text for text-rendering indicators (Slack status, Google Chat marker); None = platform default.
     typing_status_text: Optional[str] = None
@@ -435,7 +435,7 @@ class PlatformConfig:
             api_key=data.get("api_key"),
             home_channel=HomeChannel.from_dict(home) if isinstance(home, dict) else None,
             reply_to_mode=data.get("reply_to_mode", "first"),
-            gateway_restart_notification=_coerce_bool(toplevel_or_extra("gateway_restart_notification"), True),
+            gateway_restart_notification=_coerce_bool(toplevel_or_extra("gateway_restart_notification"), False),
             typing_indicator=_coerce_bool(toplevel_or_extra("typing_indicator"), True),
             typing_status_text=toplevel_or_extra("typing_status_text"),  # string passthrough, no coercion
             channel_overrides=channel_overrides,

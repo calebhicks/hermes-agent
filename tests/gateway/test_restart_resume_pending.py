@@ -867,6 +867,7 @@ async def test_warmup_disabled_by_nonpositive_timeout(monkeypatch):
 async def test_restart_notifies_home_channel_even_without_active_sessions():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,
         chat_id="home-42",
@@ -876,8 +877,7 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "I need to restart for a moment, so I’m pausing this. I’ll pick it back up when I’m back."
     ]
 
 
@@ -885,6 +885,7 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 async def test_restart_home_channel_notification_not_deduped_across_threads():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = True
     session_key = "agent:main:telegram:group:999"
     runner.session_store._entries[session_key] = MagicMock(
         origin=SessionSource(
@@ -1315,4 +1316,3 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
