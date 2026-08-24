@@ -1317,15 +1317,20 @@ def build_resume_recovery_note(
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
+            "No new user message accompanied this recovery, so do NOT emit "
+            "a 'session restored' acknowledgement or ask what to do next. "
+            "Treat the durable conversation history as the work checkpoint. "
+            "Silently reconstruct the requested outcome, the steps whose "
+            "results are proven, any external effects that remain uncertain, "
+            "and the next unfinished step. Then "
             "CONTINUE the interrupted task to completion."
         )
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step "
-            "that has no recorded result."
+            "Preserve completed work and do NOT re-run tool calls whose "
+            "results already appear in the history. If an orphan-recovery "
+            "result says an external effect is UNKNOWN, inspect current "
+            "state before deciding whether a retry is safe. Resume from the "
+            "first unfinished step whose outcome is not already proven."
         )
     note = (
         f"[System note: The previous turn was interrupted by "
