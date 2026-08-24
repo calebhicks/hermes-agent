@@ -3080,12 +3080,31 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # detection when "thread_id"/"message_thread_id" are absent
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
+                    # #38922 follow-up (2026-08-10): future.cancel() on a
+                    # run_coroutine_threadsafe future returning True does NOT
+                    # prove the coroutine never ran — an asyncio task suspended
+                    # at an await between per-bubble sends (iMessage delivers
+                    # ~30s/bubble via AppleScript) cancels successfully after
+                    # part of the payload is already on the wire, and the
+                    # standalone fallback then re-sends the WHOLE payload.
+                    # Track actual delivery entry with an Event the scheduler
+                    # thread can read: only a future whose coroutine provably
+                    # never started may fall through to standalone.
+                    delivery_started = threading.Event()
+
+                    async def _tracked_delivery(
+                        _target=route_target,
+                        _text=text_to_send,
+                        _metadata=route_metadata,
+                        _started=delivery_started,
+                    ):
+                        _started.set()
+                        return await router._deliver_to_platform(
+                            _target, _text, _metadata
+                        )
+
                     future = safe_schedule_threadsafe(
-                        router._deliver_to_platform(
-                            route_target,
-                            text_to_send,
-                            route_metadata,
-                        ),
+                        _tracked_delivery(),
                         loop,
                     )
                     if future is None:
@@ -3094,49 +3113,58 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     else:
                         send_result = None
                         timeout_handled = False
+                        # Multi-bubble payloads deliver serially (iMessage is
+                        # ~30s per bubble via AppleScript), so the confirmation
+                        # budget scales with payload size instead of a flat 60s
+                        # that a long multi-bubble brief cannot possibly meet.
+                        send_timeout = min(300, 60 + 30 * (len(text_to_send) // 800))
                         try:
-                            send_result = future.result(timeout=60)
+                            send_result = future.result(timeout=send_timeout)
                         except TimeoutError:
-                            # #38922: a slow confirmation does NOT necessarily
-                            # mean the send failed — but we must distinguish two
-                            # cases via future.cancel()'s return value:
-                            #
-                            #   cancel() == False -> the coroutine was already
-                            #     running on the gateway loop when the timeout
-                            #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
-                            #
-                            #   cancel() == True -> the scheduled callback never
-                            #     started executing (loop wedged/backlogged for
-                            #     the full 60s), so nothing was sent.  We MUST
-                            #     fall through to the standalone path or the
-                            #     message is silently dropped (worse than a
-                            #     duplicate).
-                            cancelled = future.cancel()
-                            if cancelled:
-                                msg = (
-                                    f"live adapter send to {platform_name}:{chat_id} "
-                                    "timed out before the coroutine was dispatched"
-                                )
-                                logger.warning(
-                                    "Job '%s': %s, falling back to standalone",
-                                    job["id"], msg,
-                                )
-                                target_errors.append(msg)
-                                adapter_ok = False  # fall through to standalone path
-                                timeout_handled = True
-                            else:
+                            # #38922 (+2026-08-10 follow-up): a slow
+                            # confirmation does NOT mean the send failed, and a
+                            # started delivery is NEVER cancelled here —
+                            # cancelling a coroutine suspended between bubbles
+                            # truncates the payload, and a standalone resend
+                            # duplicates it.  Only a provably never-started
+                            # coroutine (loop wedged/backlogged for the whole
+                            # budget) is cancelled and retried standalone;
+                            # anything else keeps running on the gateway loop
+                            # and is treated as delivered.
+                            if delivery_started.is_set():
                                 timed_out = True
                                 timeout_handled = True
                                 logger.warning(
-                                    "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
-                                    "assuming delivered (skipping standalone fallback "
-                                    "to avoid duplicate)",
-                                    job["id"], platform_name, chat_id,
+                                    "Job '%s': live adapter send to %s:%s did not "
+                                    "confirm within %ss but delivery already started; "
+                                    "leaving it running and assuming delivered "
+                                    "(no cancel, no standalone fallback)",
+                                    job["id"], platform_name, chat_id, send_timeout,
                                 )
+                            else:
+                                cancelled = future.cancel()
+                                if cancelled and not delivery_started.is_set():
+                                    msg = (
+                                        f"live adapter send to {platform_name}:{chat_id} "
+                                        "timed out before the coroutine was dispatched"
+                                    )
+                                    logger.warning(
+                                        "Job '%s': %s, falling back to standalone",
+                                        job["id"], msg,
+                                    )
+                                    target_errors.append(msg)
+                                    adapter_ok = False  # fall through to standalone path
+                                    timeout_handled = True
+                                else:
+                                    timed_out = True
+                                    timeout_handled = True
+                                    logger.warning(
+                                        "Job '%s': live adapter send to %s:%s timed out "
+                                        "after %ss; already dispatched (in flight), "
+                                        "assuming delivered (skipping standalone fallback "
+                                        "to avoid duplicate)",
+                                        job["id"], platform_name, chat_id, send_timeout,
+                                    )
                         except Exception as ex:
                             # A real send error (not a slow confirmation) — fall
                             # through to the standalone path so the message is
