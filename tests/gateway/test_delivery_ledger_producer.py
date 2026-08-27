@@ -3,8 +3,8 @@ obligations around the final send (gateway/platforms/base.py).
 
 Contract: obligation recorded (pending→attempting) BEFORE the send await,
 delivered/failed by SendResult afterward; slash commands, ephemeral
-replies, and empty responses are never recorded; ledger failures never
-block the send.
+replies, and empty responses are never recorded. Ledger failures preserve
+best-effort sends on other platforms but refuse iMessage before dispatch.
 """
 
 import asyncio
@@ -123,6 +123,66 @@ class TestProducerHook:
         rows = _rows()
         assert len(rows) == 1
         assert rows[0][1] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_mutation_uncertain_terminalizes_exact_obligation(self):
+        adapter = _Adapter()
+        adapter.platform = MagicMock(value="imessage")
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="outcome uncertain",
+                raw_response={
+                    "delivery": "mutation_uncertain",
+                    "receipt": "imessage-linked-receipt",
+                },
+            )
+        )
+
+        await _run(adapter, _event(), response="final answer")
+
+        with dl._connect() as conn:
+            row = conn.execute(
+                """SELECT state,provider_intent_id,payload_digest,reply_to
+                   FROM delivery_obligations"""
+            ).fetchone()
+        assert row[0] == "terminal_no_redelivery"
+        assert row[1] == "imessage-linked-receipt"
+        assert row[2] == dl.compute_payload_digest("final answer")
+        assert row[3] == "msg-42"
+        metadata = adapter.send.await_args.kwargs["metadata"]
+        context = metadata["_hermes_delivery_obligation"]
+        assert context["payload_digest"] == row[2]
+        assert context["send_payload_digest"] == row[2]
+        assert context["chat_id"] == "C1"
+        assert context["reply_to"] == "msg-42"
+
+    @pytest.mark.asyncio
+    async def test_imessage_ledger_failure_refuses_before_adapter_send(self):
+        adapter = _Adapter()
+        adapter.platform = MagicMock(value="imessage")
+        adapter.send = AsyncMock()
+
+        with patch(
+            "gateway.delivery_ledger.mark_attempting",
+            side_effect=OSError("ledger unavailable"),
+        ):
+            await _run(adapter, _event())
+
+        adapter.send.assert_not_awaited()
+        assert _rows()[0][1] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_other_platform_ledger_failure_remains_best_effort(self):
+        adapter = _Adapter()
+
+        with patch(
+            "gateway.delivery_ledger.mark_attempting",
+            side_effect=OSError("ledger unavailable"),
+        ):
+            await _run(adapter, _event())
+
+        assert adapter.sent == ["final answer"]
 
     @pytest.mark.asyncio
     async def test_late_transient_failure_signals_reconnected_runner(self):

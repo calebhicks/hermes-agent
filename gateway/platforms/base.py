@@ -71,6 +71,12 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k") -> "str | None":
         os.unlink(ogg_path)
     return None
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+
+
+class DeliveryObligationUnavailable(RuntimeError):
+    """Final iMessage delivery could not establish its no-replay ledger."""
+
+
 # History dedup is best-effort: stay well below the Discord heartbeat watchdog and fail open.
 _HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS = 5.0
 # Timed-out reads can't be cancelled mid-SQLite: cap the isolated threads so wedged lookups
@@ -3679,18 +3685,29 @@ class BasePlatformAdapter(ABC):
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
-        if is_ephemeral_response or str(event.text or "").lstrip().startswith(
-            ("/", self.typed_command_prefix or "!")):
-            return None
+        delivery_is_imessage = str(
+            getattr(delivery_adapter.platform, "value", delivery_adapter.platform)
+        ) == "imessage"
+        ledger_protected_response = not is_ephemeral_response and not str(
+            event.text or ""
+        ).lstrip().startswith(("/", self.typed_command_prefix or "!"))
+        obligation_required = ledger_protected_response and delivery_is_imessage
+        if not ledger_protected_response:
+            return None, metadata
         try:
             from gateway.delivery_ledger import (
-                compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
+                compute_obligation_id, compute_payload_digest, ledger_enabled,
+                mark_attempting, record_obligation)
             if not await asyncio.to_thread(ledger_enabled):
-                return None
+                if obligation_required:
+                    raise DeliveryObligationUnavailable("iMessage delivery ledger is disabled")
+                return None, metadata
             source = event.source
             # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
             # of the chain, not the event that opened it (see ``MessageEvent.ledger_message_id``).
@@ -3702,14 +3719,35 @@ class BasePlatformAdapter(ABC):
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
-                chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
+                chat_id=source.chat_id,
+                thread_id=str((metadata or {}).get("thread_id") or getattr(source, "thread_id", None) or "") or None,
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                reply_to=reply_to)
             await asyncio.to_thread(mark_attempting, obligation_id)
-            return obligation_id
+            delivery_metadata = metadata
+            if delivery_is_imessage:
+                delivery_metadata = dict(metadata or {})
+                delivery_metadata["_hermes_delivery_obligation"] = {
+                    "obligation_id": obligation_id,
+                    "payload_digest": compute_payload_digest(text_content),
+                    "send_payload_digest": compute_payload_digest(text_content),
+                    "chat_id": str(source.chat_id),
+                    "thread_id": str(
+                        (metadata or {}).get("thread_id")
+                        or getattr(source, "thread_id", None)
+                        or ""
+                    ),
+                    "reply_to": str(reply_to or ""),
+                }
+            return obligation_id, delivery_metadata
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
-            return None
+            if obligation_required:
+                raise DeliveryObligationUnavailable(
+                    "iMessage delivery obligation could not be recorded before provider dispatch"
+                )
+            return None, metadata
 
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
@@ -3720,9 +3758,19 @@ class BasePlatformAdapter(ABC):
         arm the runner's timed redelivery, so the reply goes out once the penalty has passed instead
         of waiting for the next restart."""
         try:
-            from gateway.delivery_ledger import is_flood_error, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                is_flood_error, mark_delivered, mark_failed, mark_terminal_no_redelivery)
             if getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, obligation_id)
+                return
+            if delivery_adapter._is_mutation_uncertain(result):
+                response = result.raw_response if isinstance(result.raw_response, dict) else {}
+                await asyncio.to_thread(
+                    mark_terminal_no_redelivery,
+                    obligation_id,
+                    str(response.get("receipt") or ""),
+                    "mutation_uncertain",
+                )
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error)
@@ -3823,8 +3871,9 @@ class BasePlatformAdapter(ABC):
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
-        obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        obligation_id, metadata = await self._record_delivery_obligation(
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            reply_to=reply_to, metadata=metadata)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
@@ -4059,7 +4108,8 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
+            if not isinstance(e, DeliveryObligationUnavailable):
+                _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
@@ -4145,6 +4195,20 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
+
+    async def delivery_obligation_redelivery_disposition(
+        self, obligation: Dict[str, Any]
+    ) -> str:
+        """Classify a claimed startup delivery obligation.
+
+        ``redeliver`` preserves ordinary recovery. Adapters with a durable
+        provider-mutation ledger may return ``terminal_no_redelivery`` when an
+        exact linked mutation might already have happened, or ``hold`` when
+        the evidence cannot be safely classified. The runner validates the
+        result and never treats an unknown value as permission to send.
+        """
+        del obligation
+        return "redeliver"
 
     def busy_input_mode_for_source(self, source: SessionSource) -> Optional[str]:
         """Optionally override busy input semantics for one source."""
