@@ -11,6 +11,7 @@ id stability, and the startup redelivery sweep's contract:
 
 import time
 import threading
+import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -93,6 +94,66 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_terminal_no_redelivery_is_not_recoverable(self):
+        _record()
+        dl.mark_terminal_no_redelivery("ob-1", "imessage-receipt")
+        _orphan("ob-1")
+        assert dl.sweep_recoverable() == []
+        assert _row("ob-1")["state"] == "terminal_no_redelivery"
+
+    def test_record_refuses_to_reset_terminal_obligation(self):
+        _record()
+        dl.mark_terminal_no_redelivery("ob-1", "imessage-receipt")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _record()
+
+        assert _row("ob-1")["state"] == "terminal_no_redelivery"
+
+    def test_pre_linkage_imessage_rows_migrate_to_hold_only(self):
+        path = dl._db_path()
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """CREATE TABLE delivery_obligations (
+                    obligation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
+                    platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+                    thread_id TEXT, content TEXT NOT NULL, state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL, owner_pid INTEGER,
+                    owner_started_at INTEGER, last_error TEXT
+                )"""
+            )
+            now = time.time()
+            fixtures = (
+                ("old-imessage-pending", "imessage", "pending"),
+                ("old-imessage-attempting", "imessage", "attempting"),
+                ("old-imessage-failed", "imessage", "failed"),
+                ("old-slack", "slack", "attempting"),
+            )
+            for oid, platform, state in fixtures:
+                conn.execute(
+                    "INSERT INTO delivery_obligations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        oid, "session", platform, "chat", None, "answer",
+                        state, 0, now, now, 999999999, 1, None,
+                    ),
+                )
+        dl.debug_rows()
+        with dl._connect() as conn:
+            states = dict(conn.execute(
+                "SELECT obligation_id,state FROM delivery_obligations"
+            ))
+            version = conn.execute(
+                "SELECT schema_version FROM delivery_ledger_meta WHERE singleton=1"
+            ).fetchone()[0]
+        assert states == {
+            "old-imessage-pending": "legacy_hold",
+            "old-imessage-attempting": "legacy_hold",
+            "old-imessage-failed": "legacy_hold",
+            "old-slack": "attempting",
+        }
+        assert version == 2
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):
@@ -162,6 +223,9 @@ class TestGatewayRedeliverySweep:
     @staticmethod
     def _adapter(success=True):
         adapter = MagicMock()
+        adapter.delivery_obligation_redelivery_disposition = AsyncMock(
+            return_value="redeliver"
+        )
         adapter.send = AsyncMock(
             return_value=MagicMock(success=success, error="" if success else "nope")
         )
@@ -198,6 +262,39 @@ class TestGatewayRedeliverySweep:
         sent = adapter.send.call_args.kwargs
         assert sent["content"].startswith(dl.RECOVERED_MARKER)
         assert sent["content"].endswith("the final answer")
+
+    @pytest.mark.asyncio
+    async def test_exact_adapter_disposition_suppresses_without_send(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter.delivery_obligation_redelivery_disposition = AsyncMock(
+            return_value="terminal_no_redelivery"
+        )
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 0
+
+        adapter.send.assert_not_awaited()
+        assert _row("ob-1")["state"] == "terminal_no_redelivery"
+        runner._async_session_store.clear_resume_pending.assert_awaited_once()
+
+    @pytest.mark.parametrize("disposition", ["hold", "unknown"])
+    @pytest.mark.asyncio
+    async def test_hold_or_invalid_disposition_never_sends(self, disposition):
+        _record()
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter.delivery_obligation_redelivery_disposition = AsyncMock(
+            return_value=disposition
+        )
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 0
+        adapter.send.assert_not_awaited()
+        assert _row("ob-1")["state"] == "redelivery_hold"
 
     @pytest.mark.parametrize(
         ("send_success", "ledger_method"),

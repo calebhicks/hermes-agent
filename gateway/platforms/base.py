@@ -63,6 +63,10 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+
+
+class DeliveryObligationUnavailable(RuntimeError):
+    """Final iMessage delivery could not establish its no-replay ledger."""
 # Delivery-time history is best-effort dedup metadata, not canonical state.
 # Keep this comfortably below the Discord heartbeat watchdog window and fail
 # open rather than withholding a legitimate attachment.
@@ -6590,12 +6594,28 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    _delivery_is_imessage = str(
+                        getattr(
+                            delivery_adapter.platform,
+                            "value",
+                            delivery_adapter.platform,
+                        )
+                    ) == "imessage"
+                    _ledger_protected_response = (
+                        not is_ephemeral_response and not str(
                         event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                        ).lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    )
+                    _obligation_required = (
+                        _ledger_protected_response and _delivery_is_imessage
+                    )
+                    if _ledger_protected_response:
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
+                                compute_payload_digest,
                                 ledger_enabled,
                                 mark_attempting,
                                 record_obligation,
@@ -6616,18 +6636,48 @@ class BasePlatformAdapter(ABC):
                                                 event.source.platform)
                                     ),
                                     chat_id=event.source.chat_id,
-                                    thread_id=getattr(event.source, "thread_id", None),
+                                    thread_id=str(
+                                        (_final_thread_metadata or {}).get("thread_id")
+                                        or getattr(event.source, "thread_id", None)
+                                        or ""
+                                    ) or None,
+                                    reply_to=_reply_anchor,
                                     content=text_content,
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
+                            else:
+                                _obligation_required = False
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
+                            if _obligation_required:
+                                raise DeliveryObligationUnavailable(
+                                    "iMessage delivery obligation could not be "
+                                    "recorded before provider dispatch"
+                                )
+                    _delivery_metadata = _final_thread_metadata
+                    if (
+                        _obligation_id is not None
+                        and _delivery_is_imessage
+                    ):
+                        _delivery_metadata = dict(_final_thread_metadata or {})
+                        _delivery_metadata["_hermes_delivery_obligation"] = {
+                            "obligation_id": _obligation_id,
+                            "payload_digest": compute_payload_digest(text_content),
+                            "send_payload_digest": compute_payload_digest(text_content),
+                            "chat_id": str(event.source.chat_id),
+                            "thread_id": str(
+                                (_final_thread_metadata or {}).get("thread_id")
+                                or getattr(event.source, "thread_id", None)
+                                or ""
+                            ),
+                            "reply_to": str(_reply_anchor or ""),
+                        }
                     result = await delivery_adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
+                        metadata=_delivery_metadata,
                     )
                     _record_delivery(result)
                     if _obligation_id is not None:
@@ -6635,10 +6685,23 @@ class BasePlatformAdapter(ABC):
                             from gateway.delivery_ledger import (
                                 mark_delivered,
                                 mark_failed,
+                                mark_terminal_no_redelivery,
                             )
 
                             if getattr(result, "success", False):
                                 await asyncio.to_thread(mark_delivered, _obligation_id)
+                            elif delivery_adapter._is_mutation_uncertain(result):
+                                response = (
+                                    result.raw_response
+                                    if isinstance(result.raw_response, dict)
+                                    else {}
+                                )
+                                await asyncio.to_thread(
+                                    mark_terminal_no_redelivery,
+                                    _obligation_id,
+                                    str(response.get("receipt") or ""),
+                                    "mutation_uncertain",
+                                )
                             else:
                                 await asyncio.to_thread(
                                     mark_failed,
@@ -6876,7 +6939,7 @@ class BasePlatformAdapter(ABC):
                     # Tests stub create_task() with non-hashable sentinels; tolerate.
                     pass
                 return  # Drain task owns the session now.
-                
+
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
@@ -6887,25 +6950,29 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            # A no-replay ledger failure must not route an untracked error
+            # bubble through the same iMessage mutation surface.
+            if not isinstance(e, DeliveryObligationUnavailable):
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(
+                        event.source, _reply_anchor_for_event(event)
+                    )
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort — don't let error reporting crash the handler
             # Preserve shutdown semantics: SystemExit/KeyboardInterrupt must
             # still propagate after the user-facing failure notification, so
             # the loop's own signal handling can shut down cleanly. Other
@@ -7031,7 +7098,7 @@ class BasePlatformAdapter(ABC):
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
-    
+
     def _cleanup_finished_session_task(
         self, session_key: str, interrupt_event: Optional[asyncio.Event]
     ) -> None:
@@ -7146,6 +7213,20 @@ class BasePlatformAdapter(ABC):
         """
         del source
         return None
+
+    async def delivery_obligation_redelivery_disposition(
+        self, obligation: Dict[str, Any]
+    ) -> str:
+        """Classify a claimed startup delivery obligation.
+
+        ``redeliver`` preserves ordinary recovery. Adapters with a durable
+        provider-mutation ledger may return ``terminal_no_redelivery`` when an
+        exact linked mutation might already have happened, or ``hold`` when
+        the evidence cannot be safely classified. The runner validates the
+        result and never treats an unknown value as permission to send.
+        """
+        del obligation
+        return "redeliver"
 
     async def session_start_context(self, event: MessageEvent) -> Optional[str]:
         """Return adapter context for an actually new/reset session.

@@ -100,7 +100,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             platform TEXT NOT NULL,
             chat_id TEXT NOT NULL,
             thread_id TEXT,
+            reply_to TEXT,
             content TEXT NOT NULL,
+            payload_digest TEXT,
+            provider_intent_id TEXT,
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
@@ -110,6 +113,42 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT
         )"""
     )
+    columns = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(delivery_obligations)"
+        )
+    }
+    for name in ("reply_to", "payload_digest", "provider_intent_id"):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE delivery_obligations ADD COLUMN {name} TEXT")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS delivery_ledger_meta (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            schema_version INTEGER NOT NULL
+        )"""
+    )
+    row = conn.execute(
+        "SELECT schema_version FROM delivery_ledger_meta WHERE singleton=1"
+    ).fetchone()
+    version = int(row[0]) if row else 0
+    if version == 0:
+        # Pre-linkage iMessage rows cannot prove whether a pending adapter
+        # intent owns the same provider mutation. Preserve them for inspection
+        # but never replay them after upgrade. Other platforms keep ordinary
+        # recovery semantics, and a rollback also ignores this new state.
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='legacy_hold', updated_at=?,
+                   last_error='pre-linkage iMessage obligation held without redelivery'
+               WHERE platform='imessage'
+                 AND state IN ('pending','attempting','failed')""",
+            (time.time(),),
+        )
+        conn.execute(
+            "INSERT INTO delivery_ledger_meta(singleton,schema_version) VALUES(1,2)"
+        )
+    elif version != 2:
+        raise RuntimeError("unsupported delivery ledger schema")
 
 
 @contextmanager
@@ -201,6 +240,11 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
 
+def compute_payload_digest(content: str) -> str:
+    """Exact digest shared with an adapter without duplicating its content."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def record_obligation(
     *,
     obligation_id: str,
@@ -209,20 +253,33 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    reply_to: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
+                reply_to, content, payload_digest, provider_intent_id,
+                state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id),
-             str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', 0, ?, ?, ?, ?)""",
+            (
+                obligation_id,
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                str(reply_to) if reply_to else None,
+                content,
+                compute_payload_digest(content),
+                now,
+                now,
+                pid,
+                started,
+            ),
         )
     _prune()
 
@@ -237,6 +294,35 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def mark_terminal_no_redelivery(
+    obligation_id: str,
+    provider_intent_id: str = "",
+    reason: str = "mutation_uncertain",
+) -> None:
+    """Durably suppress an obligation whose provider may already have mutated."""
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='terminal_no_redelivery', updated_at=?,
+                   provider_intent_id=?, last_error=?
+               WHERE obligation_id=?""",
+            (
+                time.time(),
+                provider_intent_id[:200] if provider_intent_id else None,
+                reason[:500],
+                obligation_id,
+            ),
+        )
+
+
+def mark_redelivery_hold(
+    obligation_id: str,
+    reason: str = "adapter_redelivery_classification_hold",
+) -> None:
+    """Park an obligation that cannot be classified safely for redelivery."""
+    _update_state(obligation_id, "redelivery_hold", error=reason)
 
 
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
@@ -276,13 +362,15 @@ def sweep_recoverable(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
+                      reply_to, content, payload_digest, provider_intent_id,
+                      state, attempts, created_at,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+        for (oid, session_key, platform, chat_id, thread_id, reply_to, content,
+             payload_digest, provider_intent_id, state, attempts, created_at,
+             owner_pid, owner_started_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -313,7 +401,11 @@ def sweep_recoverable(
                     "platform": platform,
                     "chat_id": chat_id,
                     "thread_id": thread_id,
+                    "reply_to": reply_to,
                     "content": content,
+                    "payload_digest": payload_digest,
+                    "provider_intent_id": provider_intent_id,
+                    "state": state,
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
@@ -329,7 +421,10 @@ def _prune(now: Optional[float] = None) -> None:
         with _transaction() as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
-                   WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
+                   WHERE state IN (
+                       'delivered', 'abandoned', 'legacy_hold',
+                       'terminal_no_redelivery', 'redelivery_hold'
+                   ) AND updated_at < ?""",
                 (cutoff,),
             )
             total = conn.execute(
@@ -372,8 +467,8 @@ def debug_rows(limit: int = 20) -> str:
     """Human-readable dump for ad-hoc inspection (sqlite3-free path)."""
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT obligation_id, session_key, state, attempts,
-                      created_at, updated_at, last_error
+            """SELECT obligation_id, session_key, platform, state, attempts,
+                      created_at, updated_at, provider_intent_id, last_error
                FROM delivery_obligations
                ORDER BY updated_at DESC LIMIT ?""",
             (limit,),
@@ -381,8 +476,10 @@ def debug_rows(limit: int = 20) -> str:
     return json.dumps(
         [
             {
-                "id": r[0], "session": r[1], "state": r[2], "attempts": r[3],
-                "created_at": r[4], "updated_at": r[5], "last_error": r[6],
+                "id": r[0], "session": r[1], "platform": r[2],
+                "state": r[3], "attempts": r[4], "created_at": r[5],
+                "updated_at": r[6], "provider_intent_id": r[7],
+                "last_error": r[8],
             }
             for r in rows
         ],

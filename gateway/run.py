@@ -12067,6 +12067,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                mark_redelivery_hold,
+                mark_terminal_no_redelivery,
                 sweep_recoverable,
             )
 
@@ -12102,17 +12104,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
+            try:
+                disposition = await adapter.delivery_obligation_redelivery_disposition(
+                    row
+                )
+            except Exception:
+                logger.warning(
+                    "obligation %s: adapter redelivery classification failed; holding",
+                    row["obligation_id"],
+                )
+                disposition = "hold"
+            if disposition not in {
+                "redeliver", "terminal_no_redelivery", "hold",
+            }:
+                logger.warning(
+                    "obligation %s: invalid adapter redelivery disposition; holding",
+                    row["obligation_id"],
+                )
+                disposition = "hold"
+            if disposition == "terminal_no_redelivery":
+                try:
+                    await asyncio.to_thread(
+                        mark_terminal_no_redelivery,
+                        row["obligation_id"],
+                        str(row.get("provider_intent_id") or ""),
+                        "adapter_linked_mutation_uncertain",
+                    )
+                except Exception:
+                    logger.debug("delivery ledger terminal update failed", exc_info=True)
+                logger.warning(
+                    "obligation %s: exact provider intent suppresses startup redelivery",
+                    row["obligation_id"],
+                )
+            elif disposition == "hold":
+                try:
+                    await asyncio.to_thread(
+                        mark_redelivery_hold,
+                        row["obligation_id"],
+                        "adapter_redelivery_classification_hold",
+                    )
+                except Exception:
+                    logger.debug("delivery ledger hold update failed", exc_info=True)
+                logger.warning(
+                    "obligation %s: adapter evidence is insufficient; held without redelivery",
+                    row["obligation_id"],
+                )
+            if disposition in {"terminal_no_redelivery", "hold"}:
+                session_key = row.get("session_key") or ""
+                if session_key:
+                    try:
+                        await self.async_session_store.clear_resume_pending(session_key)
+                    except Exception:
+                        logger.debug(
+                            "clear_resume_pending failed for %s", session_key,
+                            exc_info=True,
+                        )
+                continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            )
+            metadata = {}
+            if row.get("thread_id"):
+                metadata["thread_id"] = row["thread_id"]
+            if row.get("reply_to"):
+                metadata["reply_to"] = row["reply_to"]
+            if row["platform"] == "imessage":
+                from gateway.delivery_ledger import compute_payload_digest
+
+                metadata["_hermes_delivery_obligation"] = {
+                    "obligation_id": row["obligation_id"],
+                    "payload_digest": row.get("payload_digest") or "",
+                    "send_payload_digest": compute_payload_digest(content),
+                    "chat_id": str(row["chat_id"]),
+                    "thread_id": str(row.get("thread_id") or ""),
+                    "reply_to": str(row.get("reply_to") or ""),
+                }
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],
                     content=content,
-                    metadata=metadata,
+                    reply_to=row.get("reply_to"),
+                    metadata=metadata or None,
                 )
             except Exception as send_err:
                 logger.warning(
