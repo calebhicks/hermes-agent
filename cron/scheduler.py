@@ -2210,6 +2210,29 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _ambiguous_write_receipt(send_result) -> Optional[str]:
+    """Return a receipt for structured non-retryable ambiguous writes.
+
+    This is narrower than ``retryable=False``: target/config refusals are
+    permanent failures but do not prove a message may already be on the wire.
+    """
+    if send_result is None:
+        return None
+    if isinstance(send_result, dict):
+        raw_response = send_result.get("raw_response")
+        retryable = send_result.get("retryable")
+    else:
+        raw_response = getattr(send_result, "raw_response", None)
+        retryable = getattr(send_result, "retryable", None)
+    if retryable is True or not isinstance(raw_response, dict):
+        return None
+    delivery = str(raw_response.get("delivery") or "").strip().lower()
+    if delivery != "mutation_uncertain":
+        return None
+    receipt = raw_response.get("receipt") or raw_response.get("receipt_id")
+    return str(receipt) if receipt else "unknown"
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -2728,7 +2751,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                receipt = _ambiguous_write_receipt(send_result)
+                                if receipt is not None:
+                                    msg = (
+                                        f"{msg}; delivery outcome is mutation_uncertain "
+                                        f"(receipt={receipt}); skipping standalone fallback "
+                                        "to avoid a duplicate send"
+                                    )
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    delivery_errors.append(msg)
+                                    adapter_ok = False
+                                    continue
+                                elif transport is not None and transport.is_relay:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
