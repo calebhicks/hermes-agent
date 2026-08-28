@@ -2058,6 +2058,63 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         assert result is None, f"standalone should have delivered, got: {result!r}"
         standalone_send.assert_awaited_once()
 
+    def test_non_retryable_mutation_uncertain_send_result_does_not_fallback(self, caplog):
+        from gateway.platforms.base import SendResult
+
+        uncertain = SendResult(
+            success=False,
+            retryable=False,
+            raw_response={
+                "delivery": "mutation_uncertain",
+                "receipt": "imsg-receipt-123",
+            },
+            error="iMessage native_send outcome is uncertain; do not retry; receipt=imsg-receipt-123",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            result, standalone_send = self._run(uncertain)
+
+        assert result is not None
+        assert "mutation_uncertain" in result
+        assert "imsg-receipt-123" in result
+        standalone_send.assert_not_awaited()
+        assert "mutation_uncertain" in caplog.text
+        assert "imsg-receipt-123" in caplog.text
+        assert "falling back to standalone" not in caplog.text
+
+    def test_dict_mutation_uncertain_result_does_not_fallback(self, caplog):
+        uncertain = {
+            "success": False,
+            "retryable": False,
+            "raw_response": {
+                "delivery": "mutation_uncertain",
+                "receipt": "dict-receipt-456",
+            },
+            "error": "native send uncertain; do not retry",
+        }
+
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            result, standalone_send = self._run(uncertain)
+
+        assert result is not None
+        assert "mutation_uncertain" in result
+        assert "dict-receipt-456" in result
+        standalone_send.assert_not_awaited()
+
+    def test_non_retryable_refusal_still_falls_through_to_standalone(self):
+        from gateway.platforms.base import SendResult
+
+        refused = SendResult(
+            success=False,
+            retryable=False,
+            error="BlueBubbles chat not found for target: missing-chat",
+        )
+
+        result, standalone_send = self._run(refused)
+
+        assert result is None, f"standalone should have delivered, got: {result!r}"
+        standalone_send.assert_awaited_once()
+
 
 class TestDeliverOriginUnresolvableIsLocal:
     """Regression for #43014.
@@ -2555,4 +2612,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
