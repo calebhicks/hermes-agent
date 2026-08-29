@@ -2,7 +2,7 @@
 A2A client tools — let the Hermes agent talk to *other* agents as a peer.
 
 Tools (registered in the ``a2a`` toolset):
-  - a2a_discover(url)         -> fetch + summarize a peer's Agent Card
+  - a2a_discover(peer)        -> fetch + summarize a CONFIGURED peer's Agent Card
   - a2a_call(agent, message)  -> send a task to a peer, return its reply
   - a2a_list()                -> list configured peers + persisted conversations
   - a2a_history(context_id)   -> recall a persisted A2A conversation
@@ -50,14 +50,52 @@ def _load_config() -> dict:
         return {}
 
 
+def _configured_peer_by_url() -> dict:
+    """Map each configured peer's base URL to its name."""
+    peers = (_load_config().get("a2a_agents") or {})
+    out: dict = {}
+    for name, entry in peers.items():
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "").strip().rstrip("/")
+        if url:
+            out[url] = name
+    return out
+
+
 def _resolve_peer(agent: str) -> Optional[dict]:
-    """Resolve a peer name to {url, auth, timeout, capabilities}, or treat ``agent`` as a URL."""
-    if agent.startswith("http://") or agent.startswith("https://"):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
+    """Resolve a target to a CONFIGURED peer's {url, auth, timeout, capabilities}.
+
+    A caller-supplied ``http(s)://`` target used to short-circuit this function
+    and become its own peer with empty auth. That made ``a2a_agents`` an alias
+    table rather than an allowlist, and turned every tool in this module into
+    arbitrary HTTP egress with a model-chosen body — reachable by anything that
+    can put text in front of the agent. A URL is now admitted only when it
+    already names a configured peer, so adding a peer stays a config act.
+    """
+    agent = str(agent or "").strip()
+    if not agent:
+        return None
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
     entry = peers.get(agent)
-    if not entry:
+    if entry is None and (agent.startswith("http://") or agent.startswith("https://")):
+        name = _configured_peer_by_url().get(agent.rstrip("/"))
+        if name is not None:
+            entry = peers.get(name)
+    if not isinstance(entry, dict) or not entry:
+        return None
+    # An entry with no usable URL is not a peer. Callers already guarded on
+    # ``peer.get("url")``, but returning a truthy peer that cannot be reached
+    # made the contract here weaker than its docstring.
+    entry_url = str(entry.get("url") or "").strip()
+    if not entry_url:
+        return None
+    # urlopen honours whatever scheme it is given, so a config entry of
+    # ``file:///etc/passwd`` would be read off disk and returned as a "reply".
+    # Peers speak HTTP.
+    if not entry_url.lower().startswith(("http://", "https://")):
+        logger.warning("a2a: ignoring peer with non-HTTP url scheme")
         return None
     return {
         "url": entry.get("url", ""),
@@ -78,9 +116,31 @@ def _auth_header(auth: dict) -> dict:
 # HTTP
 # --------------------------------------------------------------------------
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Resolve-time allowlisting is not connection-time allowlisting.
+
+    urllib follows redirects by default, so a configured peer could answer 307
+    and send the very same request — method and body intact — to any host it
+    named, walking straight around ``_resolve_peer``. Peers are reached
+    directly or not at all.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"refused redirect to an unconfigured host (HTTP {code})",
+            headers,
+            fp,
+        )
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
 def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
     req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+    with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 (allowlisted peers, no redirects)
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -88,7 +148,7 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     data = json.dumps(body).encode("utf-8")
     hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+    with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 (allowlisted peers, no redirects)
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -225,9 +285,19 @@ def a2a_discover(args: dict, **_: Any) -> str:
     """Fetch and summarize the Agent Card at ``url``."""
     url = str(args.get("url") or "").strip()
     if not url:
-        return "Error: 'url' is required (e.g. http://localhost:9999)."
+        return "Error: 'url' is required (a configured peer name or its URL)."
+    # Discovery reached any host the caller named, bypassing _resolve_peer
+    # entirely. Route it through the same allowlist, and carry the peer's auth
+    # so discovering an authenticated peer works without widening anything.
+    peer = _resolve_peer(url)
+    if not peer or not peer.get("url"):
+        return (
+            f"Error: '{url}' is not a configured peer. Add it under 'a2a_agents' "
+            f"in config.yaml; discovery of unconfigured hosts is refused."
+        )
+    url = peer["url"]
     try:
-        card = _fetch_card(url, {}, _DEFAULT_TIMEOUT)
+        card = _fetch_card(url, _auth_header(peer.get("auth") or {}), _DEFAULT_TIMEOUT)
     except urllib.error.HTTPError as e:
         return f"Error: discovery failed — HTTP {e.code} from {url}."
     except Exception as e:
@@ -272,8 +342,9 @@ def a2a_call(args: dict, **_: Any) -> str:
     peer = _resolve_peer(agent)
     if not peer or not peer.get("url"):
         return (
-            f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in "
-            f"config.yaml or pass a full http(s):// URL."
+            f"Error: unknown agent '{agent}'. Only peers configured under "
+            f"'a2a_agents' in config.yaml can be reached; an unconfigured URL "
+            f"is refused. Use a2a_list() to see the configured peers."
         )
 
     try:
