@@ -438,11 +438,124 @@ class TestClientTools:
             description="finds things",
             skills=[{"id": "s", "name": "search", "description": "web search"}],
         )
+        monkeypatch.setattr(tools, "_load_config",
+                            lambda: {"a2a_agents": {"researcher": {"url": "http://localhost:9999"}}})
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: card)
         out = tools.a2a_discover({"url": "http://localhost:9999"})
         assert "researcher" in out
         assert "search" in out
         assert "JSONRPC v1.0" in out
+
+    def test_unconfigured_url_is_refused_without_any_request(self, monkeypatch):
+        """A bare URL used to become its own peer with empty auth, which made
+        a2a_agents an alias table instead of an allowlist and turned these
+        tools into arbitrary HTTP egress."""
+        monkeypatch.setattr(tools, "_load_config",
+                            lambda: {"a2a_agents": {"known": {"url": "http://localhost:9999"}}})
+
+        def explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("a request was issued to an unconfigured host")
+
+        monkeypatch.setattr(tools, "_http_get_json", explode)
+        monkeypatch.setattr(tools, "_http_post_json", explode)
+
+        for target in ("http://evil.example/x", "https://evil.example",
+                       "http://127.0.0.1:1/", "HTTP://evil.example"):
+            call_out = tools.a2a_call({"agent": target, "message": "hi"})
+            assert "unknown agent" in call_out, (target, call_out)
+            disc_out = tools.a2a_discover({"url": target})
+            assert "not a configured peer" in disc_out, (target, disc_out)
+
+        assert tools._resolve_peer("http://evil.example") is None
+
+    def test_configured_peer_still_reachable_by_name_and_by_url(self, monkeypatch):
+        """The fence must not cost the legitimate path: a peer configured under
+        a2a_agents resolves both by its name and by its exact URL, and carries
+        its auth either way."""
+        cfg = {"a2a_agents": {"draper": {
+            "url": "http://127.0.0.1:9913",
+            "auth": {"type": "bearer", "token": "tok"},
+        }}}
+        monkeypatch.setattr(tools, "_load_config", lambda: cfg)
+
+        for target in ("draper", "http://127.0.0.1:9913", "http://127.0.0.1:9913/"):
+            peer = tools._resolve_peer(target)
+            assert peer is not None, target
+            assert peer["url"] == "http://127.0.0.1:9913"
+            assert peer["auth"]["token"] == "tok"
+
+    def test_discovery_of_configured_peer_carries_its_auth(self, monkeypatch):
+        """Discovery bypassed _resolve_peer entirely and always sent empty
+        headers, so an authenticated peer could not be discovered at all."""
+        card = protocol.build_agent_card(
+            name="draper", url="http://127.0.0.1:9913/", description="gtm")
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"draper": {
+            "url": "http://127.0.0.1:9913",
+            "auth": {"type": "bearer", "token": "tok"},
+        }}})
+        seen = {}
+
+        def fake_get(url, headers, timeout):
+            seen["headers"] = headers
+            return card
+
+        monkeypatch.setattr(tools, "_http_get_json", fake_get)
+        out = tools.a2a_discover({"url": "draper"})
+        assert "Agent: draper" in out
+        assert seen["headers"].get("Authorization") == "Bearer tok"
+
+    def test_malformed_peer_entries_do_not_resolve(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "empty": {}, "nourl": {"auth": {}}, "notadict": "http://x",
+            "blank": {"url": "   "},
+        }})
+        for name in ("empty", "nourl", "notadict", "blank", "", "   ", None):
+            assert tools._resolve_peer(name) is None, name
+
+    def test_redirect_to_unconfigured_host_is_refused(self):
+        """Resolve-time allowlisting is not connection-time allowlisting: urllib
+        follows redirects by default, so a peer could 307 the same request —
+        method and body intact — at any host it named."""
+        import http.server
+        import threading
+
+        hops = []
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hops.append(self.path)
+                self.send_response(307)
+                self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, *a):  # keep test output quiet
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}"
+            with pytest.raises(urllib.error.HTTPError):
+                tools._http_get_json(url, {}, 5)
+            with pytest.raises(urllib.error.HTTPError):
+                tools._http_post_json(url, {"a": 1}, {}, 5)
+        finally:
+            srv.shutdown()
+        # The redirect was answered but never followed.
+        assert hops and all(h != "/latest/meta-data/" for h in hops)
+
+    def test_non_http_peer_scheme_is_ignored(self, monkeypatch):
+        """A config entry of file:///… would otherwise be read off disk by
+        urlopen and returned as a peer 'reply'."""
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "localfile": {"url": "file:///etc/passwd"},
+            "ftp": {"url": "ftp://example.test/x"},
+        }})
+        assert tools._resolve_peer("localfile") is None
+        assert tools._resolve_peer("ftp") is None
+        assert "unknown agent" in tools.a2a_call({"agent": "localfile", "message": "hi"})
 
     def test_call_sends_v1_message(self, monkeypatch):
         """Outbound params: contextId inside the message, v1.0 role, no kind."""
@@ -1432,6 +1545,8 @@ class TestClientTenantAndDiscovery:
                 raise urllib.error.HTTPError(url, 404, "not found", {}, None)
             return protocol.build_agent_card(name="legacy", url="http://legacy/", description="legacy")
 
+        monkeypatch.setattr(tools, "_load_config",
+                            lambda: {"a2a_agents": {"legacy": {"url": "http://legacy"}}})
         monkeypatch.setattr(tools, "_http_get_json", fake_get)
         out = tools.a2a_discover({"url": "http://legacy"})
         assert "Agent: legacy" in out

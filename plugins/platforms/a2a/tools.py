@@ -40,21 +40,74 @@ def _peer_from_entry(entry: dict, **extra: Any) -> dict:
             "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)), **extra}
 
 
+def _configured_peer_by_url() -> dict:
+    """Map each configured peer's base URL to its name."""
+    out: dict = {}
+    for name, entry in _configured_peers().items():
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "").strip().rstrip("/")
+        if url:
+            out[url] = name
+    return out
+
+
 def _resolve_peer(agent: str) -> Optional[dict]:
-    """Peer name -> {url, auth, timeout, capabilities, tenant}, or treat ``agent`` as a URL."""
-    if agent.startswith(("http://", "https://")):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
-    entry = _configured_peers().get(agent)
-    return _peer_from_entry(entry, capabilities=entry.get("capabilities", []) or [], tenant=entry.get("tenant", "")) if entry else None
+    """Resolve a target to a CONFIGURED peer's {url, auth, timeout, capabilities, tenant}.
+
+    A caller-supplied ``http(s)://`` target used to short-circuit this function
+    and become its own peer with empty auth. That made ``a2a_agents`` an alias
+    table rather than an allowlist, and turned every tool in this module into
+    arbitrary HTTP egress with a model-chosen body. A URL is now admitted only
+    when it already names a configured peer, so adding a peer stays a config act.
+    """
+    agent = str(agent or "").strip()
+    if not agent:
+        return None
+    peers = _configured_peers()
+    entry = peers.get(agent)
+    if entry is None and agent.startswith(("http://", "https://")):
+        name = _configured_peer_by_url().get(agent.rstrip("/"))
+        if name is not None:
+            entry = peers.get(name)
+    if not isinstance(entry, dict) or not entry:
+        return None
+    entry_url = str(entry.get("url") or "").strip()
+    if not entry_url:
+        return None
+    if not entry_url.lower().startswith(("http://", "https://")):
+        logger.warning("a2a: ignoring peer with non-HTTP url scheme")
+        return None
+    return _peer_from_entry(
+        entry,
+        capabilities=entry.get("capabilities", []) or [],
+        tenant=entry.get("tenant", ""),
+    )
 
 
 def _auth_header(auth: dict) -> dict:
     return {"Authorization": f"Bearer {auth['token']}"} if auth and auth.get("type") == "bearer" and auth.get("token") else {}
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Resolve-time allowlisting is not connection-time allowlisting."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"refused redirect to an unconfigured host (HTTP {code})",
+            headers,
+            fp,
+        )
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
 def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None) -> dict:
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+    with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 (allowlisted peers, no redirects)
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -150,9 +203,16 @@ def a2a_discover(args: dict, **_: Any) -> str:
     """Fetch and summarize the Agent Card at ``url``."""
     url = str(args.get("url") or "").strip()
     if not url:
-        return "Error: 'url' is required (e.g. http://localhost:9999)."
+        return "Error: 'url' is required (a configured peer name or its URL)."
+    peer = _resolve_peer(url)
+    if not peer or not peer.get("url"):
+        return (
+            f"Error: '{url}' is not a configured peer. Add it under 'a2a_agents' "
+            f"in config.yaml; discovery of unconfigured hosts is refused."
+        )
+    url = peer["url"]
     try:
-        card = _fetch_card(url, {}, _DEFAULT_TIMEOUT)
+        card = _fetch_card(url, _auth_header(peer.get("auth") or {}), _DEFAULT_TIMEOUT)
     except urllib.error.HTTPError as e:
         return f"Error: discovery failed — HTTP {e.code} from {url}."
     except Exception as e:
@@ -182,7 +242,11 @@ def a2a_call(args: dict, **_: Any) -> str:
         return "Error: both 'agent' and 'message' are required."
     peer = _resolve_peer(agent)
     if not peer or not peer.get("url"):
-        return f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in config.yaml or pass a full http(s):// URL."
+        return (
+            f"Error: unknown agent '{agent}'. Only peers configured under "
+            f"'a2a_agents' in config.yaml can be reached; an unconfigured URL "
+            f"is refused. Use a2a_list() to see the configured peers."
+        )
     try:
         reply, reply_ctx, state = _send_task(agent, peer, message, context_id)
     except urllib.error.HTTPError as e:
@@ -299,14 +363,14 @@ def _str(description: str) -> dict:
 # name -> (handler, description, properties, required)
 _TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
     "a2a_discover": (a2a_discover,
-                     "Fetch and summarize another agent's A2A Agent Card from a URL (its name, description, "
+                     "Fetch and summarize a configured peer's A2A Agent Card (its name, description, "
                      "capabilities, and skills). Use this to find out what a remote agent can do before calling it.",
-                     {"url": _str("Base URL of the remote A2A agent, e.g. http://localhost:9999")}, ["url"]),
+                     {"url": _str("Configured peer name from a2a_agents, or that peer's configured URL.")}, ["url"]),
     "a2a_call": (a2a_call,
                  "Send a natural-language task to a remote A2A agent and return its reply. The agent is a peer "
                  "(any A2A-compliant framework), not a sub-agent you control. Pass 'context_id' from a previous "
                  "reply to continue a multi-turn exchange.",
-                 {"agent": _str("Configured peer name (from a2a_agents) or a full http(s):// URL."),
+                 {"agent": _str("Configured peer name from a2a_agents, or that peer's configured URL."),
                   "message": _str("The task / message to send the peer, in natural language."),
                   "context_id": _str("Optional: context id from a prior reply, to continue the conversation.")},
                  ["agent", "message"]),
