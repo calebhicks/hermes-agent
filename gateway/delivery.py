@@ -98,6 +98,14 @@ def _send_result_error(result: Any) -> Optional[str]:
     return None if get("success", True) is not False else str(get("error") or "")
 
 
+class DeliveryResultError(RuntimeError):
+    """A platform send failed with a structured result worth preserving."""
+
+    def __init__(self, message: str, send_result: Any = None):
+        super().__init__(message)
+        self.send_result = send_result
+
+
 @dataclass
 class DeliveryTarget:
     """One target: "origin", "local", "telegram" (home channel) or "telegram:123456[:thread]"."""
@@ -311,5 +319,8 @@ class DeliveryRouter:
             send_metadata["thread_id"] = await _ensure_named_dm_topic(adapter, target.chat_id, named_topic, refresh=True)
             send_metadata["telegram_dm_topic_created_for_send"] = True
         if error is not None:
-            raise RuntimeError(error or f"{target.platform.value} delivery failed")
+            raise DeliveryResultError(
+                error or f"{target.platform.value} delivery failed",
+                send_result=result,
+            )
         return result

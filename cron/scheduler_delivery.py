@@ -1016,6 +1016,21 @@ def _confirm_adapter_delivery(
     return True
 
 
+def _ambiguous_write_receipt(send_result) -> Optional[str]:
+    """Return a receipt for structured non-retryable ambiguous writes."""
+    if send_result is None:
+        return None
+    raw_response = _result_field(send_result, "raw_response")
+    retryable = _result_field(send_result, "retryable")
+    if retryable is True or not isinstance(raw_response, dict):
+        return None
+    delivery = str(raw_response.get("delivery") or "").strip().lower()
+    if delivery != "mutation_uncertain":
+        return None
+    receipt = raw_response.get("receipt") or raw_response.get("receipt_id")
+    return str(receipt) if receipt else "unknown"
+
+
 def _is_channel_dm_topic(runtime_adapter: Any, chat_id: Any, loop: Any, job_id: str) -> bool:
     """Is an ambiguous ``telegram:<positive_chat_id>:<numeric_thread_id>`` target a channel
     Direct-Messages topic (``direct_messages_topic_id``) rather than a private-chat forum topic
@@ -1299,6 +1314,16 @@ def _live_send_text(
             job["id"], t.platform_name, t.chat_id, send_timeout)
         return True, True, None
     except Exception as ex:
+        receipt = _ambiguous_write_receipt(getattr(ex, "send_result", None))
+        if receipt is not None:
+            msg = (
+                f"live adapter delivery to {t.where} reported an ambiguous write "
+                f"(mutation_uncertain, receipt={receipt}); skipping standalone "
+                "fallback to avoid a duplicate send"
+            )
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            return True, False, None
         # Real send error (not a slow confirmation): fall through to standalone.
         target_errors.append(f"live adapter send failed: {ex}")
         raise
