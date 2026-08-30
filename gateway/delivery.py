@@ -171,6 +171,25 @@ def _send_result_error(result: Any) -> Optional[str]:
     return str(error) if error else None
 
 
+class DeliveryResultError(RuntimeError):
+    """A platform send failed with a structured result worth preserving.
+
+    ``_deliver_to_platform`` communicates failure by raising, which used to
+    flatten the adapter's SendResult into the exception STRING.  Callers with
+    retry/fallback policy (cron's standalone path above all) need the
+    structured result — most of all ``raw_response.delivery ==
+    "mutation_uncertain"``, the adapter's "this may already be on the wire;
+    do not retry" verdict.  On 2026-08-30 that verdict arrived as prose,
+    the cron scheduler could not see it, and a half-delivered brief was
+    replayed in full as duplicates.  Carry the result on the exception so no
+    policy decision ever has to parse a message string.
+    """
+
+    def __init__(self, message: str, send_result: Any = None):
+        super().__init__(message)
+        self.send_result = send_result
+
+
 def _is_thread_not_found_delivery_error(result: Any) -> bool:
     error = _send_result_error(result)
     return bool(error and "thread not found" in error.lower())
@@ -638,7 +657,10 @@ class DeliveryRouter:
                     metadata=send_metadata or None,
                 )
             if _send_result_failed(result):
-                raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
+                raise DeliveryResultError(
+                    _send_result_error(result) or f"{target.platform.value} delivery failed",
+                    send_result=result,
+                )
         return result
 
 

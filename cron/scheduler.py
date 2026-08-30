@@ -1414,6 +1414,33 @@ def _write_usage_audit(record: dict) -> None:
         logger.warning("usage_audit write failed: %s", e)
 
 
+def _ambiguous_write_receipt(send_result) -> Optional[str]:
+    """Return a receipt for structured non-retryable ambiguous writes.
+
+    Narrower than ``retryable=False``: target/config refusals are permanent
+    failures but do not prove a message may already be on the wire.  Only an
+    adapter that explicitly reports ``delivery == "mutation_uncertain"`` in
+    its raw response is claiming exactly that, and replaying such a payload
+    through any other path is how the 2026-08-28/30 duplicate briefs
+    happened.
+    """
+    if send_result is None:
+        return None
+    if isinstance(send_result, dict):
+        raw_response = send_result.get("raw_response")
+        retryable = send_result.get("retryable")
+    else:
+        raw_response = getattr(send_result, "raw_response", None)
+        retryable = getattr(send_result, "retryable", None)
+    if retryable is True or not isinstance(raw_response, dict):
+        return None
+    delivery = str(raw_response.get("delivery") or "").strip().lower()
+    if delivery != "mutation_uncertain":
+        return None
+    receipt = raw_response.get("receipt") or raw_response.get("receipt_id")
+    return str(receipt) if receipt else "unknown"
+
+
 def _interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
     """True when the Python interpreter is finalizing.
 
@@ -3350,6 +3377,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
+                # An explicitly ambiguous write is terminal for this attempt:
+                # the adapter is reporting the payload MAY already be visible
+                # to the recipient, so any further transport — standalone
+                # included — is a possible duplicate, not a retry.  The
+                # structured verdict rides the exception (DeliveryResultError)
+                # because the router communicates failure by raising; getattr
+                # keeps this transport-neutral and import-free.
+                receipt = _ambiguous_write_receipt(getattr(e, "send_result", None))
+                if receipt is not None:
+                    msg = (
+                        f"live adapter delivery to {platform_name}:{chat_id} reported "
+                        f"an ambiguous write (mutation_uncertain, receipt={receipt}); "
+                        "skipping standalone fallback to avoid a duplicate send"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    continue
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
