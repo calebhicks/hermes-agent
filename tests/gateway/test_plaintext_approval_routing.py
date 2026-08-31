@@ -33,6 +33,17 @@ def _make_source() -> SessionSource:
     )
 
 
+def _make_source_for(*, platform=Platform.BLUEBUBBLES, user_id="u1", chat_id="c1", thread_id=None) -> SessionSource:
+    return SessionSource(
+        platform=platform,
+        user_id=user_id,
+        chat_id=chat_id,
+        user_name="tester",
+        chat_type="dm",
+        thread_id=thread_id,
+    )
+
+
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(
         text=text,
@@ -42,9 +53,22 @@ def _make_event(text: str) -> MessageEvent:
     )
 
 
+def _make_reply_event(text: str, *, source: SessionSource, reply_to_message_id: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="reply-msg",
+        reply_to_message_id=reply_to_message_id,
+        reply_to_is_own_message=True,
+    )
+
+
 def _clear_approval_state():
     from tools import approval as mod
     mod._gateway_queues.clear()
+    if hasattr(mod, "_gateway_prompt_index"):
+        mod._gateway_prompt_index.clear()
     mod._gateway_notify_cbs.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
@@ -57,7 +81,10 @@ def _make_runner():
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***"),
+            Platform.BLUEBUBBLES: PlatformConfig(enabled=True, token="***"),
+        }
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
@@ -66,7 +93,7 @@ def _make_runner():
     )
     # _unwrap_ephemeral is a real base-adapter method; emulate its contract.
     adapter._unwrap_ephemeral = lambda r: (r, 0) if isinstance(r, str) else (None, 0)
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {Platform.TELEGRAM: adapter, Platform.BLUEBUBBLES: adapter}
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
@@ -88,6 +115,15 @@ def _register_blocking_approval(runner):
     source = _make_source()
     session_key = runner._session_key_for_source(source)
     entry = _ApprovalEntry({"command": "rm -rf /tmp/test"})
+    _gateway_queues.setdefault(session_key, []).append(entry)
+    return session_key, entry
+
+
+def _register_blocking_approval_for(runner, source: SessionSource, *, command: str):
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    session_key = runner._session_key_for_source(source)
+    entry = _ApprovalEntry({"command": command})
     _gateway_queues.setdefault(session_key, []).append(entry)
     return session_key, entry
 
@@ -133,3 +169,246 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     _clear_approval_state()
 
 
+@pytest.mark.parametrize("reply", ["yes", "approve", "👍"])
+def test_exact_prompt_reply_resolves_originating_approval_across_sibling_session(reply):
+    _clear_approval_state()
+    runner, adapter = _make_runner()
+    origin = _make_source_for(thread_id="origin")
+    sibling = _make_source_for(thread_id="sibling")
+    origin_key, origin_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/origin"
+    )
+    sibling_key, sibling_entry = _register_blocking_approval_for(
+        runner, sibling, command="rm -rf /tmp/sibling"
+    )
+
+    from tools.approval import bind_gateway_approval_prompt
+
+    assert bind_gateway_approval_prompt(
+        session_key=origin_key,
+        request_id=origin_entry.data["request_id"],
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+    )
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(
+            _make_reply_event(reply, source=sibling, reply_to_message_id="prompt-origin"),
+            sibling_key,
+        )
+    )
+
+    assert handled is True
+    assert origin_entry.event.is_set()
+    assert origin_entry.result == "once"
+    assert not sibling_entry.event.is_set()
+    assert sibling_entry.result is None
+    adapter._send_with_retry.assert_awaited()
+    _clear_approval_state()
+
+
+def test_exact_prompt_reply_consumes_once_and_duplicate_resolves_nothing():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    origin = _make_source_for(thread_id="origin")
+    sibling = _make_source_for(thread_id="sibling")
+    origin_key, origin_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/origin"
+    )
+    sibling_key, _sibling_entry = _register_blocking_approval_for(
+        runner, sibling, command="rm -rf /tmp/sibling"
+    )
+
+    from tools.approval import bind_gateway_approval_prompt, resolve_gateway_approval_by_prompt
+
+    bind_gateway_approval_prompt(
+        session_key=origin_key,
+        request_id=origin_entry.data["request_id"],
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+    )
+
+    assert resolve_gateway_approval_by_prompt(
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+        choice="once",
+    ) == 1
+    assert resolve_gateway_approval_by_prompt(
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+        choice="once",
+    ) == 0
+    assert origin_entry.result == "once"
+    from tools.approval import _gateway_queues
+
+    assert sibling_key in _gateway_queues
+    _clear_approval_state()
+
+
+def test_exact_prompt_reply_resolves_bound_request_id_not_origin_fifo():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    origin = _make_source_for(thread_id="origin")
+    origin_key, first_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/first"
+    )
+    _same_key, second_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/second"
+    )
+
+    from tools.approval import bind_gateway_approval_prompt, resolve_gateway_approval_by_prompt
+
+    bind_gateway_approval_prompt(
+        session_key=origin_key,
+        request_id=second_entry.data["request_id"],
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-second",
+    )
+
+    assert resolve_gateway_approval_by_prompt(
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-second",
+        choice="once",
+    ) == 1
+    assert not first_entry.event.is_set()
+    assert first_entry.result is None
+    assert second_entry.event.is_set()
+    assert second_entry.result == "once"
+    _clear_approval_state()
+
+
+def test_exact_prompt_reply_stale_binding_resolves_nothing():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    origin = _make_source_for(thread_id="origin")
+    origin_key, origin_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/origin"
+    )
+
+    from tools.approval import (
+        bind_gateway_approval_prompt,
+        resolve_gateway_approval,
+        resolve_gateway_approval_by_prompt,
+    )
+
+    bind_gateway_approval_prompt(
+        session_key=origin_key,
+        request_id=origin_entry.data["request_id"],
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+    )
+    assert resolve_gateway_approval(origin_key, "deny", request_id="different-request") == 0
+    assert resolve_gateway_approval(origin_key, "deny", request_id=origin_entry.data["request_id"]) == 1
+
+    assert resolve_gateway_approval_by_prompt(
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+        choice="once",
+    ) == 0
+    assert origin_entry.result == "deny"
+    _clear_approval_state()
+
+
+@pytest.mark.parametrize(
+    ("platform", "chat_id", "prompt_message_id"),
+    [
+        ("telegram", "c1", "prompt-origin"),
+        ("bluebubbles", "other-chat", "prompt-origin"),
+        ("bluebubbles", "c1", "other-prompt"),
+    ],
+)
+def test_exact_prompt_reply_wrong_platform_chat_or_prompt_resolves_nothing(
+    platform, chat_id, prompt_message_id
+):
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    origin = _make_source_for(thread_id="origin")
+    origin_key, origin_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/origin"
+    )
+
+    from tools.approval import bind_gateway_approval_prompt, resolve_gateway_approval_by_prompt
+
+    bind_gateway_approval_prompt(
+        session_key=origin_key,
+        request_id=origin_entry.data["request_id"],
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+    )
+
+    assert resolve_gateway_approval_by_prompt(
+        platform=platform,
+        chat_id=chat_id,
+        prompt_message_id=prompt_message_id,
+        choice="once",
+    ) == 0
+    assert not origin_entry.event.is_set()
+    assert origin_entry.result is None
+    _clear_approval_state()
+
+
+def test_unanchored_approval_word_does_not_cross_sessions():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    origin = _make_source_for(thread_id="origin")
+    sibling = _make_source_for(thread_id="sibling")
+    _origin_key, origin_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/origin"
+    )
+    sibling_key = runner._session_key_for_source(sibling)
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(
+            MessageEvent(
+                text="yes",
+                message_type=MessageType.TEXT,
+                source=sibling,
+                message_id="unanchored-yes",
+            ),
+            sibling_key,
+        )
+    )
+
+    assert handled is True
+    assert not origin_entry.event.is_set()
+    assert origin_entry.result is None
+    _clear_approval_state()
+
+
+def test_clear_session_drops_exact_prompt_binding():
+    from tools import approval as mod
+
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    origin = _make_source_for(thread_id="origin")
+    origin_key, origin_entry = _register_blocking_approval_for(
+        runner, origin, command="rm -rf /tmp/origin"
+    )
+    mod.bind_gateway_approval_prompt(
+        session_key=origin_key,
+        request_id=origin_entry.data["request_id"],
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+    )
+
+    mod.clear_session(origin_key)
+
+    assert origin_entry.event.is_set()
+    assert origin_entry.result == "deny"
+    assert mod.resolve_gateway_approval_by_prompt(
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+        choice="once",
+    ) == 0
+    _clear_approval_state()

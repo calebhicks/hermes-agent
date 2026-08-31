@@ -895,7 +895,7 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
-def _approval_send_outcome(future, timeout: float) -> str:
+def _approval_send_result(future, timeout: float) -> tuple[str, Any]:
     """Classify an approval prompt send as ``sent`` / ``failed`` / ``ambiguous``.
 
     ``ambiguous`` == the scheduling future timed out. The card may well have
@@ -915,20 +915,49 @@ def _approval_send_outcome(future, timeout: float) -> str:
     """
     if future is None:
         logger.warning("Prompt send failed: no scheduling future (loop unavailable)")
-        return "failed"
+        return "failed", None
     try:
         result = future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
-        return "ambiguous"
+        return "ambiguous", None
     except Exception as exc:
         logger.warning("Prompt send failed: %s", exc)
-        return "failed"
+        return "failed", None
     if getattr(result, "success", False):
-        return "sent"
+        return "sent", result
     logger.warning(
         "Prompt send failed: %s", getattr(result, "error", None) or "unknown error"
     )
-    return "failed"
+    return "failed", result
+
+
+def _approval_send_outcome(future, timeout: float) -> str:
+    """Backward-compatible outcome-only wrapper for approval send tests/callers."""
+    outcome, _result = _approval_send_result(future, timeout)
+    return outcome
+
+
+def _approval_choice_from_plaintext(text: str) -> str | None:
+    raw_text = (text or "").strip().lower()
+    if raw_text in {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}:
+        return "once"
+    if raw_text in {"deny", "no", "reject", "cancel", "n", "👎"}:
+        return "deny"
+    if raw_text in {"always", "approve always", "always approve"}:
+        return "always"
+    if raw_text in {"session", "approve session", "session approve"}:
+        return "session"
+    return None
+
+
+def _approval_plaintext_args(choice: str) -> tuple[str, str]:
+    if choice == "deny":
+        return "deny", ""
+    if choice == "always":
+        return "approve", "always"
+    if choice == "session":
+        return "approve", "session"
+    return "approve", ""
 
 
 def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | None":
@@ -6115,6 +6144,7 @@ class TurnRunner:
         # The callback bridges sync→async to send the approval request
         # to the user immediately.
         from tools.approval import (
+            bind_gateway_approval_prompt,
             register_gateway_notify,
             reset_current_session_key,
             set_current_session_key,
@@ -6171,8 +6201,15 @@ class TurnRunner:
                     )
                     if _approval_fut is None:
                         raise RuntimeError("send_exec_approval: loop unavailable")
-                    _outcome = _approval_send_outcome(_approval_fut, timeout=15)
+                    _outcome, _send_result = _approval_send_result(_approval_fut, timeout=15)
                     if _outcome == "sent":
+                        bind_gateway_approval_prompt(
+                            session_key=_approval_session_key,
+                            request_id=approval_data.get("request_id", ""),
+                            platform=ctx.source.platform,
+                            chat_id=ctx._status_chat_id,
+                            prompt_message_id=getattr(_send_result, "message_id", None),
+                        )
                         return
                     if _outcome == "ambiguous":
                         # Timeout ≠ failure: the card may have posted with a
@@ -6222,7 +6259,15 @@ class TurnRunner:
                     log_message="Approval text-send scheduling error",
                 )
                 if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                    _text_result = _approval_send_fut.result(timeout=15)
+                    if getattr(_text_result, "success", False):
+                        bind_gateway_approval_prompt(
+                            session_key=_approval_session_key,
+                            request_id=approval_data.get("request_id", ""),
+                            platform=ctx.source.platform,
+                            chat_id=ctx._status_chat_id,
+                            prompt_message_id=getattr(_text_result, "message_id", None),
+                        )
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
 
@@ -10187,6 +10232,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    async def _handle_exact_approval_reply(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        send_ack: bool,
+    ) -> tuple[bool, Optional[str]]:
+        if not event.allow_gateway_control:
+            return False, None
+        choice = _approval_choice_from_plaintext(event.text)
+        reply_to_id = getattr(event, "reply_to_message_id", None)
+        if not choice or not reply_to_id:
+            return False, None
+
+        from tools.approval import resolve_gateway_approval_by_prompt
+
+        count = resolve_gateway_approval_by_prompt(
+            platform=event.source.platform,
+            chat_id=event.source.chat_id,
+            prompt_message_id=reply_to_id,
+            choice=choice,
+        )
+        if not count:
+            return False, None
+
+        adapter = self._adapter_for_source(event.source)
+        if adapter:
+            adapter.resume_typing_for_chat(event.source.chat_id)
+        logger.info(
+            "Approval response via exact prompt reply: inbound_session=%s "
+            "choice=%s prompt_message_id=%s",
+            session_key, choice, reply_to_id,
+        )
+
+        if choice == "deny":
+            reply = t("gateway.deny.denied_singular")
+        else:
+            plural = "plural" if count > 1 else "singular"
+            reply = t(f"gateway.approve.{choice}_{plural}", count=count)
+
+        if send_ack and adapter and reply:
+            text, _eph_ttl = adapter._unwrap_ephemeral(reply)
+            if text:
+                anchor = self._reply_anchor_for_event(event)
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=text,
+                    reply_to=anchor,
+                    metadata=self._thread_metadata_for_source(event.source, anchor),
+                )
+            return True, None
+        return True, reply
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -10258,31 +10356,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # string.  The busy-handler path does not auto-send that return, so
         # we deliver it ourselves (mirroring the draining-case send above).
         try:
+            _handled_exact, _reply = await self._handle_exact_approval_reply(
+                event, session_key, send_ack=True,
+            )
+            if _handled_exact:
+                return True
+
             from tools.approval import has_blocking_approval
             if event.allow_gateway_control and has_blocking_approval(session_key):
-                _raw_text = (event.text or "").strip().lower()
-                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
-                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
-                _approval_handler = None
-                _normalized_args = ""
-                if _raw_text in _approve_words:
-                    _approval_handler = self._handle_approve_command
-                elif _raw_text in _deny_words:
-                    _approval_handler = self._handle_deny_command
-                elif _raw_text in {"always", "approve always", "always approve"}:
-                    _approval_handler = self._handle_approve_command
-                    _normalized_args = "always"
-                elif _raw_text in {"session", "approve session", "session approve"}:
-                    _approval_handler = self._handle_approve_command
-                    _normalized_args = "session"
-                if _approval_handler is not None:
+                _choice = _approval_choice_from_plaintext(event.text)
+                if _choice is not None:
+                    _verb, _normalized_args = _approval_plaintext_args(_choice)
+                    _approval_handler = (
+                        self._handle_deny_command
+                        if _verb == "deny"
+                        else self._handle_approve_command
+                    )
                     # Synthesize the canonical "/approve [args]" / "/deny"
                     # command text so the slash handlers parse modifiers via
                     # event.get_command_args().  Always use a literal "/" —
                     # MessageEvent.is_command()/get_command_args() only
                     # recognize the "/" prefix, not the per-platform display
                     # prefix ("!" on Slack/Matrix).
-                    _verb = "approve" if _approval_handler is self._handle_approve_command else "deny"
                     _synth = f"/{_verb}"
                     if _normalized_args:
                         _synth = f"{_synth} {_normalized_args}"
@@ -16885,6 +16980,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
         allow_gateway_control = event.allow_gateway_control
+        _handled_exact_approval, _exact_approval_reply = await self._handle_exact_approval_reply(
+            event, _quick_key, send_ack=False,
+        )
+        if _handled_exact_approval:
+            return _exact_approval_reply
+
         _up_state = self._peek_session_state(_quick_key)
         if (
             allow_gateway_control
