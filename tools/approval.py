@@ -115,6 +115,78 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_prompt_index: dict[tuple[str, str, str], tuple[str, str]] = {}
+
+
+def _approval_prompt_key(
+    platform: object,
+    chat_id: object,
+    prompt_message_id: object,
+) -> tuple[str, str, str] | None:
+    platform_value = getattr(platform, "value", platform)
+    key = (
+        str(platform_value or "").strip().lower(),
+        str(chat_id or "").strip(),
+        str(prompt_message_id or "").strip(),
+    )
+    if not all(key):
+        return None
+    return key
+
+
+def _drop_prompt_bindings_for_request(session_key: str, request_id: str) -> None:
+    for prompt_key, target in list(_gateway_prompt_index.items()):
+        if target == (session_key, request_id):
+            _gateway_prompt_index.pop(prompt_key, None)
+
+
+def bind_gateway_approval_prompt(
+    *,
+    session_key: str,
+    request_id: str,
+    platform: object,
+    chat_id: object,
+    prompt_message_id: object,
+) -> bool:
+    """Bind a confirmed outbound approval prompt to its pending request."""
+    session_key = str(session_key or "").strip()
+    request_id = str(request_id or "").strip()
+    prompt_key = _approval_prompt_key(platform, chat_id, prompt_message_id)
+    if not session_key or not request_id or prompt_key is None:
+        return False
+    with _lock:
+        if not any(
+            entry.data.get("request_id") == request_id
+            for entry in _gateway_queues.get(session_key, [])
+        ):
+            return False
+        _gateway_prompt_index[prompt_key] = (session_key, request_id)
+        return True
+
+
+def resolve_gateway_approval_by_prompt(
+    *,
+    platform: object,
+    chat_id: object,
+    prompt_message_id: object,
+    choice: str,
+    reason: Optional[str] = None,
+) -> int:
+    """Resolve the exact approval request addressed by a prompt reply."""
+    prompt_key = _approval_prompt_key(platform, chat_id, prompt_message_id)
+    if prompt_key is None:
+        return 0
+    with _lock:
+        target = _gateway_prompt_index.pop(prompt_key, None)
+    if target is None:
+        return 0
+    session_key, request_id = target
+    return resolve_gateway_approval(
+        session_key,
+        choice,
+        reason=reason,
+        request_id=request_id,
+    )
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -130,6 +202,10 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            request_id = str(entry.data.get("request_id") or "")
+            if request_id:
+                _drop_prompt_bindings_for_request(session_key, request_id)
     for entry in entries:
         entry.event.set()
 
@@ -162,6 +238,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
             _gateway_queues.pop(session_key, None)
 
     for entry in targets:
+        request_id_value = str(entry.data.get("request_id") or "")
+        if request_id_value:
+            with _lock:
+                _drop_prompt_bindings_for_request(session_key, request_id_value)
         entry.result = choice
         if reason:
             entry.reason = reason
@@ -254,6 +334,10 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            request_id = str(entry.data.get("request_id") or "")
+            if request_id:
+                _drop_prompt_bindings_for_request(session_key, request_id)
     for entry in entries:
         # Cancel blocked waits now so the old run unwinds instead of idling until timeout.
         entry.result = "deny"

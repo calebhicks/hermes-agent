@@ -1123,6 +1123,11 @@ class GatewayInboundMixin:
         Only events that may control the gateway (``allow_gateway_control``) can answer them."""
         if not event.allow_gateway_control:
             return None
+        _handled_exact_approval, _exact_approval_reply = await self._handle_exact_approval_reply(
+            event, _quick_key, send_ack=False,
+        )
+        if _handled_exact_approval:
+            return _exact_approval_reply
         _reply = self._hm_update_prompt_reply(event, _quick_key)
         if _reply is None:
             _reply = await self._hm_clarify_reply(event, source, _quick_key)

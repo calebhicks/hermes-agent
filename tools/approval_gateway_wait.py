@@ -144,6 +144,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             queue = _approval._gateway_queues.get(session_key, [])
             if entry in queue:
                 queue.remove(entry)
+            request_id = str(entry.data.get("request_id") or "")
+            if request_id:
+                _approval._drop_prompt_bindings_for_request(session_key, request_id)
             if not queue:
                 _approval._gateway_queues.pop(session_key, None)
 

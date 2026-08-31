@@ -420,6 +420,62 @@ class GatewayBusySessionMixin:
         **{w: ("approve", "session") for w in ("session", "approve session", "session approve")},
     }
 
+    async def _handle_exact_approval_reply(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        send_ack: bool,
+    ) -> tuple[bool, Optional[str]]:
+        if not event.allow_gateway_control:
+            return False, None
+        reply_to_id = getattr(event, "reply_to_message_id", None)
+        _match = self._PLAINTEXT_APPROVAL_WORDS.get((event.text or "").strip().lower())
+        if _match is None or not reply_to_id:
+            return False, None
+        _verb, _normalized_args = _match
+        if _verb == "deny":
+            choice = "deny"
+        elif _normalized_args == "always":
+            choice = "always"
+        elif _normalized_args == "session":
+            choice = "session"
+        else:
+            choice = "once"
+
+        from tools.approval import resolve_gateway_approval_by_prompt
+
+        count = resolve_gateway_approval_by_prompt(
+            platform=event.source.platform,
+            chat_id=event.source.chat_id,
+            prompt_message_id=reply_to_id,
+            choice=choice,
+        )
+        if not count:
+            return False, None
+
+        adapter = self._adapter_for_source(event.source)
+        if adapter:
+            adapter.resume_typing_for_chat(event.source.chat_id)
+        logger.info(
+            "Approval response via exact prompt reply: inbound_session=%s choice=%s "
+            "prompt_message_id=%s",
+            session_key, choice, reply_to_id,
+        )
+
+        if choice == "deny":
+            reply = t("gateway.deny.denied_singular")
+        else:
+            plural = "plural" if count > 1 else "singular"
+            reply = t(f"gateway.approve.{choice}_{plural}", count=count)
+
+        if send_ack and adapter and reply:
+            text, _eph_ttl = adapter._unwrap_ephemeral(reply)
+            if text:
+                await self._send_busy_reply(event, adapter, text, plain_anchor=True)
+            return True, None
+        return True, reply
+
     async def _route_plaintext_approval_while_busy(self, event: MessageEvent, session_key: str) -> bool:
         """Route a bare "yes"/"no" to the approval handlers while a dangerous-command approval blocks.
 
@@ -429,6 +485,12 @@ class GatewayBusySessionMixin:
         # not queue behind a turn that can't start until it resolves (auto-deny deadlock). Gated on
         # has_blocking_approval so a conversational "yes" never fires a command.
         try:
+            _handled_exact, _reply = await self._handle_exact_approval_reply(
+                event, session_key, send_ack=True,
+            )
+            if _handled_exact:
+                return True
+
             from tools.approval import has_blocking_approval
             # --- Approval response routing (#46866) --- When the agent is blocked waiting for a
             # dangerous-command approval, plain-text responses like "yes" or "approve" must be routed to the

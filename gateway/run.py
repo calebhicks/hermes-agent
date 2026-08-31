@@ -713,23 +713,23 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
-def _approval_send_outcome(future, timeout: float) -> str:
+def _approval_send_result(future, timeout: float) -> tuple[str, Any]:
     """Classify an approval prompt send as ``sent`` / ``failed`` / ``ambiguous``.
 
     ``ambiguous`` = future timed out but the card may have posted: keep the registration, do NOT re-send.
     Only a DEFINITIVE failure (error result / non-timeout exception / no future) re-asks; logged here."""
     if future is None:
         logger.warning("Prompt send failed: no scheduling future (loop unavailable)")
-        return "failed"
+        return "failed", None
     try:
         result = future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
-        return "ambiguous"
+        return "ambiguous", None
     except Exception as exc:
         logger.warning("Prompt send failed: %s", exc)
-        return "failed"
+        return "failed", None
     if getattr(result, "success", False):
-        return "sent"
+        return "sent", result
     # P5(b): a connector DECLINE is not a lane failure. The connector
     # authorized the destination and refused it; re-sending the same content as
     # plain text into that same chat is the exfiltration the egress guard
@@ -755,7 +755,7 @@ def _approval_send_outcome(future, timeout: float) -> str:
         # outcome, not an authorization one, and this lane has three verdicts
         # rather than the boolean the shared helper answers.
         logger.warning("Prompt send AMBIGUOUS (lost ack): %s", _raw.get("error"))
-        return "ambiguous"
+        return "ambiguous", result
     if declined_send(result):
         # Both shapes, one classifier: a structured body, or the uniform
         # decline sentence from an older connector.
@@ -763,9 +763,15 @@ def _approval_send_outcome(future, timeout: float) -> str:
             "Prompt send DECLINED by connector egress guard: %s",
             getattr(result, "error", None),
         )
-        return "declined"
+        return "declined", result
     logger.warning("Prompt send failed: %s", getattr(result, "error", None) or "unknown error")
-    return "failed"
+    return "failed", result
+
+
+def _approval_send_outcome(future, timeout: float) -> str:
+    """Backward-compatible outcome-only wrapper for approval send tests/callers."""
+    outcome, _result = _approval_send_result(future, timeout)
+    return outcome
 
 
 def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | None":

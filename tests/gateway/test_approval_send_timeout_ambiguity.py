@@ -21,13 +21,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from gateway.run import _approval_send_outcome
+from gateway.run import _approval_send_outcome, _approval_send_result
 
 
 class _Result:
-    def __init__(self, success, error=None):
+    def __init__(self, success, error=None, message_id=None):
         self.success = success
         self.error = error
+        self.message_id = message_id
 
 
 def test_timeout_is_ambiguous_not_failure():
@@ -44,6 +45,22 @@ def test_success_is_sent():
     fut = MagicMock()
     fut.result.return_value = _Result(True)
     assert _approval_send_outcome(fut, timeout=1) == "sent"
+
+
+def test_success_preserves_confirmed_message_id_for_prompt_binding():
+    fut = MagicMock()
+    fut.result.return_value = _Result(True, message_id="prompt-123")
+    outcome, result = _approval_send_result(fut, timeout=1)
+    assert outcome == "sent"
+    assert result.message_id == "prompt-123"
+
+
+def test_timeout_has_no_confirmed_message_id_for_prompt_binding():
+    fut = MagicMock()
+    fut.result.side_effect = concurrent.futures.TimeoutError()
+    outcome, result = _approval_send_result(fut, timeout=0.01)
+    assert outcome == "ambiguous"
+    assert result is None
 
 
 def test_definitive_error_result_is_failed():
