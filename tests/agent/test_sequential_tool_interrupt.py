@@ -166,8 +166,12 @@ def test_no_deadline_still_runs_on_worker(monkeypatch, fake_agent):
     assert seen_thread and seen_thread[0] != threading.current_thread().ident
 
 
-def test_never_parallel_tools_stay_inline(monkeypatch, fake_agent):
-    """clarify (interactive) keeps the inline path — it owns its own wait."""
+@pytest.mark.parametrize(
+    "function_name",
+    ["clarify", "mcp__conductor_caleb_relay__ask_caleb"],
+)
+def test_never_parallel_tools_stay_inline(monkeypatch, fake_agent, function_name):
+    """Human-wait tools keep the inline path and own their own deadlines."""
 
     seen_thread = []
 
@@ -184,7 +188,7 @@ def test_never_parallel_tools_stay_inline(monkeypatch, fake_agent):
 
     managed = _run_sequential_tool_execution_middleware(
         fake_agent,
-        function_name="clarify",
+        function_name=function_name,
         function_args={},
         effective_task_id="t",
         tool_call_id="call_4",

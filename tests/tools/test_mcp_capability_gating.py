@@ -176,6 +176,11 @@ class TestKeepaliveInterval:
 
 
     @pytest.mark.asyncio
+    async def test_configured_interval_is_used_as_seconds(self):
+        assert await self._captured_interval({"keepalive_interval": 90_000}) == 90_000
+
+
+    @pytest.mark.asyncio
     async def test_interval_clamped_to_floor(self):
         from tools.mcp_tool import _MIN_KEEPALIVE_INTERVAL
         # A sub-floor value must clamp up, never busy-loop the keepalive.
@@ -345,4 +350,3 @@ class TestKeepaliveProbeFallback:
         # list_tools must not be called — no tools capability advertised.
         task.session.list_tools.assert_not_called()
         assert task._ping_unsupported is False
-

@@ -25,7 +25,12 @@ from tools.threat_patterns import scan_for_threats
 logger = logging.getLogger(__name__)
 
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections"})
+# The Conductor relay is a reviewed downstream mount that owns its own human-reply expiry.
+_NEVER_PARALLEL_TOOLS = frozenset({
+    "clarify",
+    "manage_connections",
+    "mcp__conductor_caleb_relay__ask_caleb",
+})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({

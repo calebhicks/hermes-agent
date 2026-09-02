@@ -117,6 +117,17 @@ def _clarify_call(call_id: str = "clarify-1"):
     )
 
 
+def _relay_call(call_id: str = "relay-1"):
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(
+            name="mcp__conductor_caleb_relay__ask_caleb",
+            arguments='{"message": "?", "why_needed": "canary"}',
+        ),
+    )
+
+
 def test_sequential_tool_timeout_emits_result_and_continues(tmp_path, monkeypatch):
     agent = _make_agent(tmp_path)
     first_started = threading.Event()
@@ -347,3 +358,44 @@ def test_sequential_timeout_does_not_cut_clarify_human_wait(
     assert "timed out" not in messages[0]["content"]
     assert messages[1]["content"] == "second result"
     assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
+
+
+def test_sequential_timeout_does_not_cut_conductor_relay_human_wait(
+    tmp_path, monkeypatch
+):
+    """The reviewed relay owns its human-reply expiry, not the generic deadline."""
+    agent = _make_agent(tmp_path)
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "1.0")
+    terminal_events: list[dict] = []
+
+    def _dispatch(name, _args, _task_id, *, tool_call_id, **_kwargs):
+        if name == "mcp__conductor_caleb_relay__ask_caleb":
+            time.sleep(1.3)
+            return "human reply"
+        return "second result"
+
+    def _capture_terminal_event(*_args, **kwargs):
+        terminal_events.append(kwargs)
+
+    messages: list[dict] = []
+    started = time.monotonic()
+    response = SimpleNamespace(
+        tool_calls=[
+            _relay_call(),
+            _tool_call("next"),
+        ]
+    )
+    with (
+        patch("model_tools.handle_function_call", side_effect=_dispatch),
+        patch(
+            "agent.tool_executor._emit_terminal_post_tool_call",
+            side_effect=_capture_terminal_event,
+        ),
+    ):
+        execute_tool_calls_sequential(agent, response, messages, "task")
+
+    assert time.monotonic() - started < 10.0
+    assert [message["tool_call_id"] for message in messages] == ["relay-1", "next"]
+    assert messages[0]["content"] == "human reply"
+    assert messages[1]["content"] == "second result"
+    assert all(event.get("error_type") != "tool_timeout" for event in terminal_events)

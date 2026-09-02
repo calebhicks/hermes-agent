@@ -111,11 +111,15 @@ class TestPlanToolBatchSegments:
         assert [tc.id for tc in segments[1][1]] == ["b1", "r3"]
 
 
-    def test_never_parallel_tool_is_a_barrier(self):
+    @pytest.mark.parametrize(
+        "human_wait_tool",
+        ["clarify", "mcp__conductor_caleb_relay__ask_caleb"],
+    )
+    def test_never_parallel_tool_is_a_barrier(self, human_wait_tool):
         calls = [
             _tc("web_search", call_id="r1"),
             _tc("web_search", call_id="r2"),
-            _tc("clarify", '{"question":"?"}', call_id="c1"),
+            _tc(human_wait_tool, '{"question":"?"}', call_id="c1"),
         ]
         segments = _plan_tool_batch_segments(calls)
         assert _kinds(segments) == ["parallel", "sequential"]
