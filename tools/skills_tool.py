@@ -253,9 +253,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             return _json({"success": True, "skills": [], "categories": [],
                           "message": "No skills found in skills/ directory."})
         if category:
-            all_skills = [s for s in all_skills if s.get("category") == category]
+            all_skills = [s for s in all_skills if (s.get("category") or "general") == category]
         all_skills = _sort_skills(all_skills)
-        categories = sorted({s.get("category") for s in all_skills if s.get("category")})
+        categories = sorted({s.get("category") or "general" for s in all_skills})
         return _json({
             "success": True, "skills": all_skills, "categories": categories,
             "count": len(all_skills),

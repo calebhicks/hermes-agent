@@ -1299,10 +1299,15 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
 
 
 def _apply_agent_section(agent, _agent_cfg):
-    # Skills config: nudge interval for skill creation reminders
+    # Skills config: nudge interval and system-prompt discovery depth.
     agent._skill_nudge_interval = 10
+    agent._skill_index_mode = "full"
+    skills_config = _cfg_dict(_agent_cfg, "skills")
     with suppress(Exception):
-        agent._skill_nudge_interval = int(_agent_cfg.get("skills", {}).get("creation_nudge_interval", 10))
+        agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+    with suppress(Exception):
+        if str(skills_config.get("index_mode", "full")).strip().lower() == "scaffold":
+            agent._skill_index_mode = "scaffold"
 
     _agent_section = _cfg_dict(_agent_cfg, "agent")
     agent.budget_warning_ratio = normalize_budget_warning_ratio(

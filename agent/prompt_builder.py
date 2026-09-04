@@ -1147,7 +1147,7 @@ def _build_snapshot_entry(skill_file: Path, skills_dir: Path, frontmatter: dict,
     if len(parts) >= 3 and parts[0] == ORG_MIRROR_DIR_NAME:
         org_id, parts = parts[1], parts[2:]
     skill_name = skill_file.parent.name  # == parts[-2] whenever a parent component exists
-    category = "general" if len(parts) < 2 else "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
+    category = "/".join(parts[:-2]) or "general"
     platforms = frontmatter.get("platforms") or []
     platforms = [platforms] if isinstance(platforms, str) else platforms
     entry = {
@@ -1213,12 +1213,14 @@ def _current_session_platform_hint() -> str:
 
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None, available_toolsets: "set[str] | None" = None,
-    compact_categories: "frozenset[str] | None" = None, skills_dir_override: "Path | None" = None,
+    compact_categories: "frozenset[str] | None" = None, index_mode: str = "full",
+    skills_dir_override: "Path | None" = None,
 ) -> str:
     """Compact skill index for the system prompt.
 
     External dirs (``skills.external_dirs``) are read-only and lose name collisions to local skills.
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
+    ``index_mode='scaffold'`` lists family categories first, then lets ``skills_list(category=...)`` reveal leaves.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
     """
@@ -1236,7 +1238,8 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, index_mode,
+            project_dirs)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1297,7 +1300,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
-    compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
+    compact_categories: "frozenset[str] | None", available_tools: "set[str] | None", index_mode: str,
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list."""
     if not skills_by_category:
@@ -1315,6 +1318,15 @@ def _render_skills_index(
     index_lines = []
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
+        if index_mode == "scaffold":
+            cat_desc = category_descriptions.get(category, "")
+            leaf_count = len({name for name, _ in entries})
+            suffix = f": {cat_desc}" if cat_desc and category not in demoted else ""
+            index_lines.append(
+                f"  - {category} ({leaf_count} leaf skill"
+                f"{'s' if leaf_count != 1 else ''}){suffix}"
+            )
+            continue
         if category in demoted:
             index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
             continue
@@ -1325,6 +1337,29 @@ def _render_skills_index(
             if name not in seen:
                 seen.add(name)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
+    if index_mode == "scaffold":
+        return (
+            "## Skills (progressive disclosure)\n"
+            "Start from the user's request and the skill families below; do not inspect every leaf on every turn. "
+            "When a family could materially change your next action, call skills_list(category='...') to reveal "
+            "its leaf names and descriptions, then load the relevant leaf with skill_view(name). If the user names "
+            "a leaf skill, or you already know the exact matching leaf, load it directly without opening its family. "
+            "Expand as many families as the request actually crosses — there is no fixed skill count. Widen when "
+            "new evidence changes the task, the first route fails, or another domain becomes material; availability "
+            "alone is not a reason to load a skill. A skill already preloaded for a scheduled job is active and does "
+            "not need rediscovery. Once the requested outcome is complete, respond; do not open another family solely "
+            "to pursue adjacent follow-up work.\n"
+            "Whenever the user asks you to configure, set up, install, enable, disable, modify, or troubleshoot "
+            "Hermes Agent itself — its CLI, config, models, providers, tools, skills, voice, gateway, plugins, or any "
+            "feature — load the `hermes-agent` skill first.\n"
+            "\n"
+            "<available_skill_families>\n"
+            + "\n".join(index_lines) + "\n"
+            "</available_skill_families>\n\n"
+            "All leaf skills remain available through skills_list and skill_view. Proceed without loading a leaf "
+            "when no family is materially relevant."
+        )
+
     return (
         "## Skills\n"
         "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
@@ -1351,17 +1386,25 @@ def _render_skills_index(
 def _build_skills_system_prompt_inner(
     skills_dir: "Path", external_dirs: "list[Path]", available_tools: "set[str] | None",
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
+    index_mode: str,
     project_dirs: "list[Path] | None" = None,
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     project_dirs = project_dirs or []
+    can_expand_families = available_tools is not None and {
+        "skills_list",
+        "skill_view",
+    }.issubset(available_tools)
+    resolved_index_mode = (
+        "scaffold" if index_mode == "scaffold" and can_expand_families else "full"
+    )
     cache_key = (
         str(skills_dir), tuple(str(d) for d in external_dirs), tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
-        _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
+        _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())), resolved_index_mode,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1419,7 +1462,8 @@ def _build_skills_system_prompt_inner(
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    result = _render_skills_index(
+        skills_by_category, category_descriptions, compact_categories, available_tools, resolved_index_mode)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

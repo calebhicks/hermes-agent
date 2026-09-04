@@ -99,6 +99,12 @@ class TestSnapshotEntryProvenance:
         assert "org_id" not in entry
         assert entry["category"] == "devops"
 
+    def test_top_level_personal_entry_uses_general_category(self, tmp_path):
+        skills = tmp_path / "skills"
+        d = _mk_skill(skills, "beta", name="beta")
+        entry = _build_snapshot_entry(d / "SKILL.md", skills, {"name": "beta"}, "d")
+        assert entry["category"] == "general"
+
 
 class TestListingCollisionsAndLabels:
     def _render(self, tmp_path, monkeypatch):

@@ -633,6 +633,14 @@ class TestFindAllSkillsSecureSetup:
             assert "readiness_status" not in skill
             assert "missing_prerequisites" not in skill
 
+    def test_general_category_expands_uncategorized_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "uncategorized")
+            result = json.loads(skills_list(category="general"))
+        assert result["success"] is True
+        assert [skill["name"] for skill in result["skills"]] == ["uncategorized"]
+        assert result["categories"] == ["general"]
+
 
 class TestSkillViewPrerequisites:
     def test_legacy_prerequisites_expose_required_env_setup_metadata(

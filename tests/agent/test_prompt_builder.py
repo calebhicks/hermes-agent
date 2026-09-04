@@ -346,6 +346,96 @@ class TestBuildSkillsSystemPrompt:
         assert "Write threads" in full
 
 
+    def test_scaffold_index_shows_families_without_leaf_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for name, description in (("inbox", "Triage mail"), ("draft", "Write mail")):
+            d = tmp_path / "skills" / "email" / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+        (tmp_path / "skills" / "email" / "DESCRIPTION.md").write_text(
+            "---\ndescription: Handle email work\n---\n"
+        )
+        result = build_skills_system_prompt(
+            available_tools={"skills_list", "skill_view"},
+            index_mode="scaffold",
+            compact_categories=frozenset({"email"}),
+        )
+        assert "email (2 leaf skills)" in result
+        assert "inbox" not in result
+        assert "draft" not in result
+        assert "Triage mail" not in result
+        assert "Handle email work" not in result
+        assert "skills_list(category='...')" in result
+        assert "there is no fixed skill count" in result
+        assert "<available_skill_families>" in result
+
+
+    def test_scaffold_uses_general_for_uncategorized_leaf(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "uncategorized"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: uncategorized\ndescription: Handle loose work\n---\n"
+        )
+        result = build_skills_system_prompt(
+            available_tools={"skills_list", "skill_view"}, index_mode="scaffold"
+        )
+        assert "general (1 leaf skill)" in result
+        assert "uncategorized (1 leaf skill)" not in result
+
+
+    def test_scaffold_and_full_indexes_have_separate_cache_entries(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "email" / "inbox"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: inbox\ndescription: Triage mail\n---\n"
+        )
+        scaffold = build_skills_system_prompt(
+            available_tools={"skills_list", "skill_view"}, index_mode="scaffold"
+        )
+        full = build_skills_system_prompt(index_mode="full")
+        assert "inbox" not in scaffold
+        assert "inbox: Triage mail" in full
+
+
+    def test_scaffold_falls_back_to_full_when_family_cannot_expand(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "email" / "inbox"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: inbox\ndescription: Triage mail\n---\n"
+        )
+        result = build_skills_system_prompt(
+            available_tools={"skill_view"}, index_mode="scaffold"
+        )
+        assert "inbox: Triage mail" in result
+        assert "<available_skill_families>" not in result
+
+
+    def test_scaffold_falls_back_to_full_when_tool_availability_is_unknown(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "email" / "inbox"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: inbox\ndescription: Triage mail\n---\n"
+        )
+        result = build_skills_system_prompt(index_mode="scaffold")
+        assert "inbox: Triage mail" in result
+        assert "<available_skill_families>" not in result
+
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
