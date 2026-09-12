@@ -1458,6 +1458,30 @@ class TestMultiAgentRouting:
         assert card["supportedInterfaces"][0]["tenant"] == "research"
         assert {s["name"] for s in card["skills"]} == {"research", "web"}
 
+    def test_configured_agent_skills_survive_partial_registry(self, monkeypatch):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+        from tools.registry import registry
+
+        monkeypatch.setattr(registry, "get_registered_toolset_names", lambda: ["web"])
+        monkeypatch.setattr(registry, "get_tool_names_for_toolset", lambda name: ["search"] if name == "web" else [])
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "research": {
+                    "profile": "research",
+                    "capabilities": ["web", "research"],
+                }
+            }
+        }))
+
+        card = adapter._build_card(
+            "http://agents.example.com/",
+            agent=adapter._agents["research"],
+        )
+
+        assert {s["name"] for s in card["skills"]} == {"research", "web"}
+
     def test_tenant_routing_selects_agent_without_path_prefix(self):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig

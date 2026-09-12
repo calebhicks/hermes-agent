@@ -442,6 +442,8 @@ class A2AAdapter(BasePlatformAdapter):
             mapping = {n: tool_registry.get_tool_names_for_toolset(n)
                        for n in tool_registry.get_registered_toolset_names() if allowed is None or n in allowed}
             if mapping:
+                for name in configured or []:
+                    mapping.setdefault(str(name), [])
                 return protocol.skills_from_toolsets(mapping)
         except Exception:
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
