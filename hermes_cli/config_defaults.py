@@ -490,6 +490,7 @@ DEFAULT_CONFIG = {
     # still only wait their real handshake time.
     "mcp_single_query_discovery_timeout": 15.0,
     "mcp": {  # MCP runtime behavior (distinct from mcp_servers: definitions and auxiliary.mcp).
+        "explicit_toolsets_only": False,  # Never add implicit global MCP servers to a managed profile.
         # Auto-reload MCP connections when config.yaml's mcp_servers changes (CLI watcher). Every
         # reload rebuilds the tool surface and INVALIDATES the provider prompt cache (next message
         # re-sends the full prefix) — costly on long-context models. When false the watcher still
@@ -1239,6 +1240,9 @@ DEFAULT_CONFIG = {
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
         # toolsets=["web"] doesn't strip MCP). false = strict intersection.
         "inherit_mcp_toolsets": True,
+        # Operator-owned denylist applied after child inheritance and role expansion. Use this
+        # for authority-bearing toolsets that may be available to a parent but never to children.
+        "blocked_child_toolsets": [],
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
         # Hard per-summary char ceiling on subagent results, layered on the dynamic budget (each

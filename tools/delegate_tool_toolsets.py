@@ -6,7 +6,7 @@ import logging
 from typing import List, Optional
 
 from toolsets import TOOLSETS
-from tools.delegate_tool_config import _get_inherit_mcp_toolsets
+from tools.delegate_tool_config import _get_blocked_child_toolsets, _get_inherit_mcp_toolsets
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -34,6 +34,15 @@ def _is_mcp_toolset_name(name: str) -> bool:
     except Exception:
         target = None
     return bool(target and str(target).startswith("mcp-"))
+
+def _canonical_toolset_name(name: str) -> str:
+    """Normalize a configured or runtime toolset name through MCP aliases."""
+    normalized = str(name or "").strip()
+    try:
+        from tools.registry import registry
+        return registry.get_toolset_alias_target(normalized) or normalized
+    except Exception:
+        return normalized
 
 def _expand_parent_toolsets(parent_toolsets: set) -> set:
     """Add every toolset whose tools are a subset of the parent's tools: a parent on a composite like ``hermes-cli``
@@ -108,7 +117,27 @@ def _resolve_child_toolsets(
         inherited_disabled = [name for name in inherited_disabled if name != "delegation"]
         if "delegation" not in child_toolsets:
             child_toolsets.append("delegation")
+    configured_blocked = list(
+        dict.fromkeys(
+            normalized
+            for name in _get_blocked_child_toolsets()
+            if (normalized := str(name or "").strip())
+        )
+    )
+    blocked_identities = {_canonical_toolset_name(name) for name in configured_blocked}
+    child_toolsets = [
+        name for name in child_toolsets
+        if _canonical_toolset_name(name) not in blocked_identities
+    ]
+    configured_denials = configured_blocked + sorted(
+        blocked_identities - set(configured_blocked)
+    )
     child_disabled_toolsets = list(
-        dict.fromkeys(inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"])
+        dict.fromkeys(
+            inherited_disabled
+            + _blocked_toolsets_for_role(effective_role)
+            + ["kanban"]
+            + configured_denials
+        )
     )
     return child_toolsets, child_disabled_toolsets

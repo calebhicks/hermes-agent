@@ -1436,6 +1436,11 @@ platform_toolsets:
 #     sessions quickly (e.g. Unreal Engine editor MCP, ~15s), otherwise idle
 #     tool calls hit an expired session and pay a slow reconnect. Floored at 5s.
 #
+# Managed profiles can require explicit MCP toolsets, even after tool-picker
+# saves remove no_mcp or every named server is disabled. Default: false.
+# mcp:
+#   explicit_toolsets_only: true
+#
 # mcp_servers:
 #   time:
 #     command: uvx
@@ -1654,6 +1659,7 @@ delegation:
                                               # The parent TUI owns stdin, so blocking would deadlock; non-interactive resolution is required.
                                               # Both choices emit a logger.warning audit line. Flip to true only for cron/batch pipelines.
   # inherit_mcp_toolsets: true                # When explicit child toolsets are narrowed, also keep the parent's MCP toolsets (default: true). Set false for strict intersection.
+  # blocked_child_toolsets: []                # Toolsets children must never receive, even through inheritance or a role/composite expansion.
   # model: "google/gemini-3-flash-preview"    # Override model for subagents (empty = inherit parent)
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.

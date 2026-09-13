@@ -399,7 +399,8 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     silently drops every MCP server). Mirrors ``_get_platform_tools``: ``no_mcp`` sentinel -> none
     (stripped); any MCP server already listed -> allowlist, add nothing; else union all enabled."""
     result = [t for t in per_job if t != "no_mcp"]
-    if "no_mcp" in per_job:
+    from hermes_cli.tools_config import _mcp_explicit_toolsets_only
+    if _mcp_explicit_toolsets_only(cfg) or "no_mcp" in per_job:
         return result
     # lazy: avoid heavy hermes_cli import at module load; shares MCP-membership with gateway/CLI
     from hermes_cli.tools_config import enabled_mcp_server_names
@@ -415,14 +416,14 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Toolset list for a cron job. Precedence: per-job ``enabled_toolsets`` (+ MCP merge) >
     ``cron`` platform config (``_get_platform_tools``, which strips _DEFAULT_OFF_TOOLSETS so fresh
-    installs run without ``moa``) > ``None`` on any failure (full default set).
+    installs run without ``moa``) > legacy ``None`` on failure (managed profiles raise).
 
     1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update). Keeps the agent's
     job-scoped toolset override intact — #6130. Enabled MCP servers are layered on per
     ``_merge_mcp_into_per_job_toolsets`` so a native-toolset allowlist does not silently strip MCP tools. 2.
     Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``) so users can gate cron toolsets
     globally without recreating every job. 3. ``None`` on any lookup failure — AIAgent loads the full
-    default set (legacy behavior before this change, preserved as the safety net).
+    default set (legacy behavior, except explicit-MCP-only profiles fail closed).
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
@@ -431,6 +432,9 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:
+        mcp_config = (cfg or {}).get("mcp") or {}
+        if not isinstance(mcp_config, dict) or mcp_config.get("explicit_toolsets_only", False) is not False:
+            raise RuntimeError("Cron toolset resolution failed; explicit-MCP-only profile cannot use defaults") from exc
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",
             exc)

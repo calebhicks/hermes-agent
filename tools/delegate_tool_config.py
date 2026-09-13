@@ -166,6 +166,26 @@ def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     return is_truthy_value(_cfg().get("inherit_mcp_toolsets"), default=True)
 
+def _get_blocked_child_toolsets() -> List[str]:
+    """Toolsets that delegation must never pass to a child.
+
+    This is an operator-owned denylist, applied after inheritance and role
+    expansion. Only a YAML list is accepted so a misshaped value cannot be
+    mistaken for an iterable of toolset names.
+    """
+    raw = _cfg().get("blocked_child_toolsets", [])
+    if not isinstance(raw, list):
+        raise ValueError(
+            "delegation.blocked_child_toolsets must be a list; refusing child toolset resolution"
+        )
+    return list(
+        dict.fromkeys(
+            name
+            for value in raw
+            if isinstance(value, str) and (name := value.strip())
+        )
+    )
+
 def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
