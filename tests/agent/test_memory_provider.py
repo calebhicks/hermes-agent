@@ -1418,6 +1418,10 @@ class TestMemoryInjectionRejectsMalformedSchema:
         agent._context_engine_tool_names = set()
         assert inject_memory_provider_tools(agent) == 1
         assert agent.valid_tool_names == {"gbrain_lookup"}
+        from tools.mcp_tool_agent import _reinject_post_build_tools
+        rebuilt, names = [], set()
+        _reinject_post_build_tools(agent, rebuilt, names)
+        assert names == {"gbrain_lookup"}
         assert "memory" not in resolve_toolset("gbrain_read")
         assert memory_provider_tool_allowed(agent, "gbrain_lookup")
         for name in ("memory", "delegate_task", "session_search", "memory_write", "new_management_tool"):
