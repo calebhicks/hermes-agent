@@ -1408,6 +1408,27 @@ class TestMemoryInjectionRejectsMalformedSchema:
         assert names == {"good_tool"}
         assert agent.valid_tool_names == {"good_tool"}
 
+    def test_gbrain_read_scope_blocks_other_provider_tools_and_builtin_writes(self):
+        from agent.memory_manager import memory_provider_tool_allowed
+        from agent.inline_tool_executors import resolve_invoke_tool_executor
+        from agent.tool_executor import _resolve_sequential_dispatch
+        from toolsets import resolve_toolset
+        agent = self._agent_with(*[{"name": name, "parameters": {}} for name in ("gbrain_lookup", "memory_write", "new_management_tool")])
+        agent.enabled_toolsets = ["gbrain_read"]
+        agent._context_engine_tool_names = set()
+        assert inject_memory_provider_tools(agent) == 1
+        assert agent.valid_tool_names == {"gbrain_lookup"}
+        assert "memory" not in resolve_toolset("gbrain_read")
+        assert memory_provider_tool_allowed(agent, "gbrain_lookup")
+        for name in ("memory_write", "new_management_tool"):
+            assert not memory_provider_tool_allowed(agent, name)
+            execute = resolve_invoke_tool_executor(agent, name)
+            assert "outside" in execute(agent, {}, None)
+            ref = SimpleNamespace(name=name, args={}, task_id="test", call_id="call", trace=[])
+            assert "outside" in _resolve_sequential_dispatch(agent, ref, []).execute({})
+        agent.disabled_toolsets = ["memory"]
+        assert not memory_provider_tool_allowed(agent, "gbrain_lookup")
+
 
 class TestTrivialPromptClassifier:
     """is_trivial_prompt — the shared gate for core prefetch + provider injection."""

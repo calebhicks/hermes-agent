@@ -95,6 +95,8 @@ def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]], disable
         return False
     if "memory" in enabled_toolsets:
         return True
+    if "gbrain_read" in enabled_toolsets and "gbrain_read" not in (disabled_toolsets or []):
+        return True
     try:
         from toolsets import resolve_toolset
 
@@ -153,6 +155,8 @@ def inject_memory_provider_tools(agent: Any) -> int:
     added = 0
     for raw_schema in get_schemas():
         schema = normalize_tool_schema(raw_schema)
+        if schema is not None and not memory_provider_tool_allowed(agent, schema["name"]):
+            continue
         if schema is None:
             logger.warning(
                 "Memory provider returned a tool schema with no resolvable "
@@ -163,7 +167,26 @@ def inject_memory_provider_tools(agent: Any) -> int:
             agent.valid_tool_names.add(schema["name"])
             existing_tool_names.add(schema["name"])
             added += 1
+    if "gbrain_read" in (getattr(agent, "enabled_toolsets", None) or []):
+        from gateway.session_context import get_session_env
+        context_id = get_session_env("HERMES_CONSULT_CONTEXT_ID", "")
+        nonce = get_session_env("HERMES_CONSULT_WORKER_NONCE", "")
+        if get_session_env("HERMES_SESSION_SOURCE", "") == "conductor" and context_id and nonce:
+            print("CONDUCTOR_CONTEXT " + json.dumps({
+                "kind": "tools", "context_id": context_id, "nonce": nonce,
+                "session_id": getattr(agent, "session_id", ""),
+                "tools": sorted(t for t in existing_tool_names if t == "gbrain_lookup"),
+            }), file=sys.stderr, flush=True)
     return added
+
+
+def memory_provider_tool_allowed(agent: Any, name: str) -> bool:
+    """Use the same fixed provider boundary at discovery and both dispatch paths."""
+    if not memory_provider_tools_exposed(agent):
+        return False
+    if "gbrain_read" in (getattr(agent, "enabled_toolsets", None) or []):
+        return name == "gbrain_lookup"
+    return True
 
 
 # -- Context fencing helpers --------------------------------------------------

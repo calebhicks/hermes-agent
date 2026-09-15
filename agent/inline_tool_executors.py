@@ -214,6 +214,9 @@ def resolve_invoke_tool_executor(agent, function_name: str) -> Optional[InlineTo
         return INLINE_TOOL_EXECUTORS[function_name]
     memory_manager = agent._memory_manager
     if memory_manager and memory_manager.has_tool(function_name):
+        from agent.memory_manager import memory_provider_tool_allowed
+        if not memory_provider_tool_allowed(agent, function_name):
+            return lambda agent, args, ctx: json.dumps({"error": "Memory tool is outside this session's tool scope"})
         return lambda agent, args, ctx: agent._memory_manager.handle_tool_call(function_name, args)
     if function_name == "message_agent":
         return None

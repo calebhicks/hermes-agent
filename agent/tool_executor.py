@@ -1519,6 +1519,9 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
             error_log="context_engine.handle_tool_call raised for %s: %s",
         )
     if agent._memory_manager and agent._memory_manager.has_tool(function_name):
+        from agent.memory_manager import memory_provider_tool_allowed
+        if not memory_provider_tool_allowed(agent, function_name):
+            return _SequentialDispatch(execute=lambda next_args: json.dumps({"error": "Memory tool is outside this session's tool scope"}))
         # Memory-provider tools (hindsight_retain, honcho_search, ...) are not in the registry.
         return _SequentialDispatch(
             execute=lambda next_args: agent._memory_manager.handle_tool_call(function_name, next_args),
