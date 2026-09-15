@@ -1420,7 +1420,7 @@ class TestMemoryInjectionRejectsMalformedSchema:
         assert agent.valid_tool_names == {"gbrain_lookup"}
         assert "memory" not in resolve_toolset("gbrain_read")
         assert memory_provider_tool_allowed(agent, "gbrain_lookup")
-        for name in ("memory_write", "new_management_tool"):
+        for name in ("memory", "delegate_task", "session_search", "memory_write", "new_management_tool"):
             assert not memory_provider_tool_allowed(agent, name)
             execute = resolve_invoke_tool_executor(agent, name)
             assert "outside" in execute(agent, {}, None)

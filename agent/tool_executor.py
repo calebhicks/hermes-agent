@@ -34,6 +34,7 @@ from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
     emit_terminal_post_tool_call,
+    inline_tool_scope_error,
     tool_hook_ids,
 )
 from agent.tool_dispatch_helpers import (
@@ -1502,6 +1503,9 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )
+    scope_error = inline_tool_scope_error(agent, function_name)
+    if scope_error is not None:
+        return _SequentialDispatch(execute=lambda next_args: scope_error)
     if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
