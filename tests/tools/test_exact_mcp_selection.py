@@ -14,7 +14,7 @@ def test_exact_selection_blocks_guessed_direct_and_deferred_calls(monkeypatch, t
     import model_tools
     from tools.registry import registry
     calls = []
-    for op in ("search", "put_page"):
+    for op in ("search", "put_page", "read_resource", "get_prompt", "list_prompts"):
         name = f"mcp__fixture__{op}"
         registry.register(name=name, toolset="mcp-fixture", handler=lambda args, **kw: calls.append(args) or '{"result": []}',
                           schema={"name": name, "description": op, "parameters": {"type": "object", "properties": {}}})
@@ -31,11 +31,16 @@ def test_exact_selection_blocks_guessed_direct_and_deferred_calls(monkeypatch, t
         assert "error" in json.loads(result)
         assert calls == []
         result, _ = model_tools._dispatch_bridge_tool("tool_describe", {"names": ["mcp__fixture__put_page"]}, selected, None)
+        assert "not available" in result or "not found" in result or "error" in result
+        for op in ("put_page", "read_resource", "get_prompt", "list_prompts"):
+            denied = model_tools.handle_function_call(f"mcp__fixture__{op}", {}, enabled_toolsets=selected)
+            assert "error" in json.loads(denied)
+        assert calls == []
         assert "mcp__fixture__put_page" not in {d["function"]["name"] for d in model_tools.get_tool_definitions(selected, quiet_mode=True, skip_tool_search_assembly=True)}
         model_tools.handle_function_call("mcp__fixture__search", {}, enabled_toolsets=selected)
         assert len(calls) == 1
     finally:
-        for op in ("search", "put_page"):
+        for op in ("search", "put_page", "read_resource", "get_prompt", "list_prompts"):
             registry.deregister(f"mcp__fixture__{op}")
 
 
@@ -52,4 +57,4 @@ def test_readonly_skill_view_does_not_execute_template(monkeypatch, tmp_path):
     assert "Plain guidance" in result
     sentinel.assert_not_called()
     escaped = model_tools.handle_function_call("skill_view", {"name": "../config.yaml"}, enabled_toolsets=["skills_read"])
-    assert "Plain guidance" not in escaped
+    assert "path traversal" in escaped

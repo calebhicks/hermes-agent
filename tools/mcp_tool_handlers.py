@@ -128,7 +128,7 @@ def _lookup_reconnectable_server(server_name: str, require_loop: bool = False):
 
 def _retry_once(server_name: str, retry_call, op_description: str, what: str):
     """Re-run ``retry_call`` after a recovery step. Returns the result (closing the breaker)
-    when it is not an error payload; None when the retry raised or errored (caller falls through)."""
+    including application errors; None when the retry raises (caller falls through)."""
     try:
         result = retry_call()
     except Exception as retry_exc:
@@ -159,7 +159,11 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
             _core._reset_server_error(server_name)
         result = _retry_once(server_name, retry_call, op_description, "auth recovery")
         if result is not None:
-            return result
+            # A completed application failure is normally healthy transport,
+            # but an auth failure after refresh remains terminal needs_reauth.
+            if not (_result_is_error(result) and any(marker in str(result).lower()
+                    for marker in ("401", "unauthorized", "needs_reauth", "invalid_token"))):
+                return result
     return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name), needs_reauth=True, server=server_name)
 
 

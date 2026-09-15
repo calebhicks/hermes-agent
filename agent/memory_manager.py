@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import re
+import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
@@ -30,6 +31,7 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_CONSULT_PREFETCH_READINESS_S = 15.0
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -407,6 +409,21 @@ class MemoryManager:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
+        # The consultation provider gets its 15s readiness window plus the
+        # ordinary external-call budget. Report what the manager actually
+        # returns; a late daemon-thread result must never certify injection.
+        from gateway.session_context import get_session_env
+        nonce = get_session_env("HERMES_CONSULT_WORKER_NONCE", "")
+        consult = (provider.name == "gbrain" and get_session_env("HERMES_SESSION_SOURCE", "") == "conductor"
+                   and bool(re.fullmatch(r"[a-f0-9]{64}", nonce))
+                   and bool(get_session_env("HERMES_CONSULT_CONTEXT_ID", "")))
+        timeout = _CONSULT_PREFETCH_READINESS_S + self._external_prefetch_timeout if consult else self._external_prefetch_timeout
+        def delivery(status: str) -> None:
+            if consult:
+                print("CONDUCTOR_CONTEXT " + json.dumps({
+                    "kind": "recall_delivery", "context_id": get_session_env("HERMES_CONSULT_CONTEXT_ID", ""),
+                    "nonce": nonce, "session_id": session_id, "status": status,
+                }), file=sys.stderr, flush=True)
         result_box: Dict[str, Any] = {}
 
         def _run() -> None:
@@ -420,22 +437,25 @@ class MemoryManager:
             existing = self._external_prefetch_threads.get(provider.name)
             if existing is not None and existing.is_alive():
                 logger.debug("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
+                delivery("timeout")
                 return ""
             self._external_prefetch_threads[provider.name] = thread
             thread.start()
 
-        thread.join(self._external_prefetch_timeout)
+        thread.join(timeout)
         if thread.is_alive():
             logger.warning(
                 "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
-                "the stuck call returns", provider.name, self._external_prefetch_timeout,
+                "the stuck call returns", provider.name, timeout,
             )
+            delivery("timeout")
             return ""
 
         with self._external_prefetch_lock:
             if self._external_prefetch_threads.get(provider.name) is thread:
                 self._external_prefetch_threads.pop(provider.name, None)
         if "error" in result_box:
+            delivery("failed")
             raise result_box["error"]
         result = result_box.get("value", "")
         if result and result.strip():
@@ -445,6 +465,7 @@ class MemoryManager:
                 result, session_id=session_id, source=f"{provider.name} memory prefetch",
                 config=self._external_prefetch_spill_config,
             )
+        delivery("injected" if result and result.strip() else "empty")
         return result
 
     def describe_recall(self) -> str:

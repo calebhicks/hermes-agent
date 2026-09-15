@@ -1509,3 +1509,44 @@ class TestSystemPromptGateParity:
         assert added == 1
         names = {t["function"]["name"] for t in agent.tools}
         assert "mnemosyne_remember" in names
+
+
+def _consult_recall_env(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "conductor")
+    monkeypatch.setenv("HERMES_CONSULT_CONTEXT_ID", "fixture-context")
+    monkeypatch.setenv("HERMES_CONSULT_WORKER_NONCE", "a" * 64)
+
+
+def test_consult_manager_allows_readiness_and_reports_actual_delivery(monkeypatch, capsys):
+    _consult_recall_env(monkeypatch)
+    provider = FakeMemoryProvider("gbrain")
+    provider._prefetch_result = "Remembered context"
+    mgr = MemoryManager()
+    joins = []
+    real_join = threading.Thread.join
+    def join(thread, timeout=None):
+        joins.append(timeout)
+        return real_join(thread, timeout)
+    monkeypatch.setattr(threading.Thread, "join", join)
+    assert mgr._prefetch_provider(provider, "actual question", session_id="fixture") == "Remembered context"
+    assert joins == [23.0]
+    events = [json.loads(l.split(" ", 1)[1]) for l in capsys.readouterr().err.splitlines() if l.startswith("CONDUCTOR_CONTEXT ")]
+    assert events[-1]["kind"] == "recall_delivery"
+    assert events[-1]["status"] == "injected"
+
+
+def test_late_consult_recall_never_reports_delivery(monkeypatch, capsys):
+    _consult_recall_env(monkeypatch)
+    import agent.memory_manager as mm
+    monkeypatch.setattr(mm, "_CONSULT_PREFETCH_READINESS_S", 0.01)
+    mgr = MemoryManager(external_prefetch_timeout=0.01)
+    provider = BlockingPrefetchProvider("gbrain")
+    provider._prefetch_result = "Late context"
+    try:
+        assert mgr._prefetch_provider(provider, "actual question", session_id="fixture") == ""
+        event = json.loads(capsys.readouterr().err.split("CONDUCTOR_CONTEXT ")[-1])
+        assert event["status"] == "timeout"
+    finally:
+        provider.release.set()
+        mgr._external_prefetch_threads["gbrain"].join(1)
+    assert "recall_delivery" not in capsys.readouterr().err

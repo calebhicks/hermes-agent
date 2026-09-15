@@ -502,7 +502,8 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
     filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
-    if os.environ.get("HERMES_SESSION_SOURCE") == "conductor" and os.environ.get("HERMES_CONSULT_WORKER_NONCE"):
+    if (os.environ.get("HERMES_SESSION_SOURCE") == "conductor" and os.environ.get("HERMES_CONSULT_WORKER_NONCE")
+            and enabled_toolsets and "skills_read" in enabled_toolsets and any(":" in n for n in enabled_toolsets)):
         import sys
         print("CONDUCTOR_CONTEXT " + json.dumps({
             "kind": "tools", "context_id": os.environ.get("HERMES_CONSULT_CONTEXT_ID"),
@@ -816,7 +817,8 @@ def _approval_observability(ids: _CallIds):
 
 
 def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
-                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
+                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool,
+                  readonly_skill: bool = False) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
     dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
@@ -828,6 +830,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        if readonly_skill:
+            from tools.skills_tool import skill_view
+            return skill_view(next_args.get("name", ""), file_path=next_args.get("file_path"),
+                              task_id=ids.task_id, preprocess=False)
         from tools.tool_gateway.names import is_connector_name
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call
@@ -955,13 +961,11 @@ def handle_function_call(
 
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
-        if function_name == "skill_view" and enabled_toolsets and "skills_read" in enabled_toolsets and "skills" not in enabled_toolsets:
-            from tools.skills_tool import skill_view
-            result = skill_view(function_args.get("name", ""), file_path=function_args.get("file_path"),
-                                task_id=task_id, preprocess=False)
-            return _emit(result, duration_ms=_elapsed_ms(start))
+        readonly_skill = bool(function_name == "skill_view" and enabled_toolsets
+                              and "skills_read" in enabled_toolsets and "skills" not in enabled_toolsets)
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
-                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware,
+                               readonly_skill=readonly_skill)
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
