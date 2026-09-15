@@ -102,8 +102,8 @@ def _result_is_error(result) -> bool:
 
 
 def _record_call_outcome(server_name: str, result) -> Any:
-    """Breaker bookkeeping: an error payload from the tool itself still counts as a strike."""
-    (_core._bump_server_error if _result_is_error(result) else _core._reset_server_error)(server_name)
+    """A completed RPC proves transport health, including application errors."""
+    _core._reset_server_error(server_name)
     return result
 
 
@@ -133,8 +133,6 @@ def _retry_once(server_name: str, retry_call, op_description: str, what: str):
         result = retry_call()
     except Exception as retry_exc:
         logger.warning("MCP %s/%s retry after %s failed: %s", server_name, op_description, what, retry_exc)
-        return None
-    if _result_is_error(result):
         return None
     _core._reset_server_error(server_name)
     return result

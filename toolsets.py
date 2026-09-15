@@ -98,6 +98,7 @@ TOOLSETS = {
         ["computer_use"],
     ),
     "terminal": _ts("Terminal/command execution and process management tools", ["terminal", "process_manage"]),
+    "skills_read": _ts("Read skill documents without management or template execution", ["skills_list", "skill_view"]),
     "skills": _ts(
         "Access, create, edit, and manage skill documents with specialized "
         "instructions and knowledge",

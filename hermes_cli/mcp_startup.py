@@ -36,7 +36,7 @@ def set_mcp_server_filter(toolsets: object) -> Optional[list[str]]:
     if not names or "all" in names or "*" in names:
         _mcp_server_filter = None
     else:
-        _mcp_server_filter = names
+        _mcp_server_filter = list(dict.fromkeys(name.split(":", 1)[0] for name in names))
     return _mcp_server_filter
 
 

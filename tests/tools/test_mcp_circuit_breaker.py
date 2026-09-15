@@ -572,3 +572,27 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
             run_task.cancel()
 
     asyncio.run(_scenario())
+
+
+def test_application_errors_keep_transport_available(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _make_tool_handler, _retry_once
+    calls = []
+    async def respond(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(isError=True, content=[SimpleNamespace(text='{"error":"page_not_found"}')])
+    _install_stub_server(mcp_tool, "application-errors", respond)
+    _mcp_loop._ensure_mcp_loop()
+    try:
+        handler = _make_tool_handler("application-errors", "get_page", 10)
+        for _ in range(5):
+            result = handler({})
+            assert "page_not_found" in result
+            assert "unreachable" not in result
+        assert len(calls) == 5
+        assert mcp_tool._server_error_counts.get("application-errors", 0) == 0
+        assert "page_not_found" in _retry_once("application-errors", lambda: result, "get_page", "recovery")
+    finally:
+        _cleanup(mcp_tool, "application-errors")

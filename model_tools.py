@@ -282,7 +282,14 @@ def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, 
     from toolsets import bundle_non_core_tools, get_toolset
     verb, icon = ("Disabled", "🚫") if disable else ("Enabled", "✅")
     for name in names:
-        if validate_toolset(name):
+        if ":" in name:
+            # Exact MCP operation selectors also constrain the deferred catalog.
+            from tools.mcp_tool_schema import mcp_prefixed_tool_name
+            server, operation = name.split(":", 1)
+            candidate = mcp_prefixed_tool_name(server, operation)
+            resolved = [candidate] if candidate in resolve_toolset(server) else []
+            label = f"{verb} MCP operation"
+        elif validate_toolset(name):
             label = f"{verb} toolset"
             if disable and (name.startswith("hermes-") or (get_toolset(name) or {}).get("posture")):
                 # Bundles/postures re-list the core tools without owning them;
@@ -495,6 +502,13 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
     filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
+    if os.environ.get("HERMES_SESSION_SOURCE") == "conductor" and os.environ.get("HERMES_CONSULT_WORKER_NONCE"):
+        import sys
+        print("CONDUCTOR_CONTEXT " + json.dumps({
+            "kind": "tools", "context_id": os.environ.get("HERMES_CONSULT_CONTEXT_ID"),
+            "nonce": os.environ["HERMES_CONSULT_WORKER_NONCE"],
+            "tools": sorted(_last_resolved_tool_names),
+        }), file=sys.stderr, flush=True)
 
     if not quiet_mode:
         print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
@@ -905,6 +919,12 @@ def handle_function_call(
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         )
 
+    # Exact-selector sessions must enforce their catalog on direct calls too.
+    # A guessed native name must not bypass progressive disclosure's gate.
+    if enabled_toolsets and any(":" in name for name in enabled_toolsets):
+        if function_name not in _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True):
+            return _emit(tool_error("Tool is not available in this session."), status="blocked")
+
     from tools.tool_gateway.names import is_connector_name, parse_connector_name
     if function_name == "manage_connections" or is_connector_name(function_name):
         if "manage_connections" not in _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True):
@@ -935,6 +955,11 @@ def handle_function_call(
 
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
+        if function_name == "skill_view" and enabled_toolsets and "skills_read" in enabled_toolsets and "skills" not in enabled_toolsets:
+            from tools.skills_tool import skill_view
+            result = skill_view(function_args.get("name", ""), file_path=function_args.get("file_path"),
+                                task_id=task_id, preprocess=False)
+            return _emit(result, duration_ms=_elapsed_ms(start))
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
         duration_ms = _elapsed_ms(start)
