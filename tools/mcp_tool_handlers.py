@@ -162,7 +162,8 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
             # A completed application failure is normally healthy transport,
             # but an auth failure after refresh remains terminal needs_reauth.
             if not (_result_is_error(result) and any(marker in str(result).lower()
-                    for marker in ("401", "unauthorized", "needs_reauth", "invalid_token"))):
+                    for marker in ("401", "403", "unauthorized", "forbidden", "needs_reauth", "invalid_token",
+                                   "authentication required", "token expired", "expired token", "invalid credentials"))):
                 return result
     return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name), needs_reauth=True, server=server_name)
 

@@ -610,7 +610,8 @@ def test_application_auth_failure_after_refresh_remains_terminal(monkeypatch):
     monkeypatch.setattr(handlers._loop, "_run_on_mcp_loop", lambda fn, **kw: asyncio.run(fn()))
     monkeypatch.setattr(handlers, "_lookup_reconnectable_server", lambda name: None)
     monkeypatch.setattr(handlers, "_strike", lambda name, message, **kw: json.dumps({"error": message, **kw}))
-    result = handlers._handle_auth_error_and_retry("fixture", RuntimeError(), lambda: '{"error":"401 Unauthorized"}', "test")
-    assert json.loads(result)["needs_reauth"] is True
+    for error in ("401 Unauthorized", "403 Forbidden", "authentication required", "token expired", "expired token", "invalid credentials"):
+        result = handlers._handle_auth_error_and_retry("fixture", RuntimeError(), lambda: json.dumps({"error": error}), "test")
+        assert json.loads(result)["needs_reauth"] is True
     result = handlers._handle_auth_error_and_retry("fixture", RuntimeError(), lambda: '{"error":"page_not_found"}', "test")
     assert json.loads(result) == {"error": "page_not_found"}
