@@ -31,7 +31,8 @@ def test_exact_selection_blocks_guessed_direct_and_deferred_calls(monkeypatch, t
         assert "error" in json.loads(result)
         assert calls == []
         result, _ = model_tools._dispatch_bridge_tool("tool_describe", {"names": ["mcp__fixture__put_page"]}, selected, None)
-        assert "not available" in result or "not found" in result or "error" in result
+        assert json.loads(result)["not_found"] == ["mcp__fixture__put_page"]
+        assert json.loads(result)["tools"] == {}
         for op in ("put_page", "read_resource", "get_prompt", "list_prompts"):
             denied = model_tools.handle_function_call(f"mcp__fixture__{op}", {}, enabled_toolsets=selected)
             assert "error" in json.loads(denied)

@@ -609,7 +609,6 @@ def test_application_auth_failure_after_refresh_remains_terminal(monkeypatch):
     monkeypatch.setattr(mcp_oauth_manager, "get_manager", lambda: SimpleNamespace(handle_401=recovered))
     monkeypatch.setattr(handlers._loop, "_run_on_mcp_loop", lambda fn, **kw: asyncio.run(fn()))
     monkeypatch.setattr(handlers, "_lookup_reconnectable_server", lambda name: None)
-    monkeypatch.setattr(handlers._core, "_reset_server_error", lambda name: None)
     monkeypatch.setattr(handlers, "_strike", lambda name, message, **kw: json.dumps({"error": message, **kw}))
     result = handlers._handle_auth_error_and_retry("fixture", RuntimeError(), lambda: '{"error":"401 Unauthorized"}', "test")
     assert json.loads(result)["needs_reauth"] is True
