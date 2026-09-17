@@ -336,7 +336,15 @@ class CLILoopsMixin:
                     max_turns = 20
                 return GoalManager(session_id=sid, default_max_turns=max_turns)
             return make
-        return self._session_bound_manager("_goal_manager", "goal manager", load)
+        mgr = self._session_bound_manager("_goal_manager", "goal manager", load)
+        if mgr is not None:
+            refresh = getattr(mgr, "refresh", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception as exc:
+                    logging.debug("goal manager refresh failed: %s", exc)
+        return mgr
 
     def _get_heartbeat_manager(self):
         """HeartbeatManager bound to the current session_id (see ``_session_bound_manager``)."""
@@ -569,7 +577,8 @@ class CLILoopsMixin:
         except Exception:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
-            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+            last_response, user_initiated=True, background_processes=_bg_procs,
+            active_delegations=_active_deleg, guard_external_changes=True)
         _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")

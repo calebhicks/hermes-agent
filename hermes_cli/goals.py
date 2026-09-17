@@ -1075,6 +1075,17 @@ class GoalManager:
     def state(self) -> Optional[GoalState]:
         return self._state
 
+    def refresh(self) -> Optional[GoalState]:
+        """Reload persisted state into this manager.
+
+        The classic CLI keeps a manager object for the session, while model tools
+        and GUI/gateway surfaces may write the same goal through a fresh manager.
+        Refresh in place so existing callbacks/tests holding this object see the
+        current persisted state without replacing the manager itself.
+        """
+        self._state = load_goal(self.session_id)
+        return self._state
+
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
 
@@ -1134,6 +1145,17 @@ class GoalManager:
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> Dict[str, Any]:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
+
+    def _adopt_external_change(self, expected_json: str) -> Optional[Dict[str, Any]]:
+        """Return a stop decision if another writer changed this goal mid-evaluation."""
+        current = load_goal(self.session_id)
+        current_json = current.to_json() if current is not None else ""
+        if current_json == expected_json:
+            return None
+        self._state = current
+        status = current.status if current is not None else None
+        reason = "goal state changed externally during evaluation"
+        return _decision(status, False, None, "inactive" if status != "active" else "changed", reason, "")
 
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
@@ -1438,6 +1460,7 @@ class GoalManager:
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
+        guard_external_changes: bool = False,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -1445,6 +1468,7 @@ class GoalManager:
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        original_json = state.to_json() if guard_external_changes else ""
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
@@ -1460,11 +1484,15 @@ class GoalManager:
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
+        if guard_external_changes and state.gates:
+            original_json = state.to_json()
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
         )
+        if guard_external_changes and (external_decision := self._adopt_external_change(original_json)):
+            return external_decision
         state.last_verdict = verdict
         state.last_reason = reason
         # Parse failures reset on any usable reply INCLUDING transport errors, so a flaky network
