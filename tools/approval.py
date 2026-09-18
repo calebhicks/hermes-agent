@@ -2675,15 +2675,18 @@ def resolve_gateway_approval_by_prompt(
     if prompt_key is None:
         return 0
     with _lock:
-        target = _gateway_prompt_index.pop(prompt_key, None)
-    if target is None:
-        return 0
-    session_key, request_id, bound_owner_user_id = target
-    supplied_owner_user_id = str(owner_user_id or "").strip()
-    if require_owner and not bound_owner_user_id:
-        return 0
-    if bound_owner_user_id and supplied_owner_user_id != bound_owner_user_id:
-        return 0
+        target = _gateway_prompt_index.get(prompt_key)
+        if target is None:
+            return 0
+        session_key, request_id, bound_owner_user_id = target
+        supplied_owner_user_id = str(owner_user_id or "").strip()
+        if require_owner and not bound_owner_user_id:
+            return 0
+        if bound_owner_user_id and supplied_owner_user_id != bound_owner_user_id:
+            return 0
+        # Consume the correlation only after every authenticated identity
+        # check passes; an attacker must not be able to burn the owner's reply.
+        _gateway_prompt_index.pop(prompt_key, None)
     return resolve_gateway_approval(
         session_key,
         choice,
