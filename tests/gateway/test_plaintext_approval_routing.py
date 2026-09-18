@@ -13,6 +13,7 @@ this covers the bare-word forms Signal/SMS users naturally type.
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -452,5 +453,118 @@ def test_native_tapback_requires_bound_owner_and_exact_target():
         platform="bluebubbles", chat_id="c1", target_message_id="prompt-origin",
         owner_user_id="owner",
     ))
+    assert entry.result == "once"
+    _clear_approval_state()
+
+
+def test_wrong_bound_owner_does_not_consume_native_binding():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    source = _make_source_for(user_id="owner")
+    session_key, entry = _register_blocking_approval_for(
+        runner, source, command="rm -rf /tmp/origin"
+    )
+    from tools.approval import bind_gateway_approval_prompt, resolve_gateway_approval_by_prompt
+
+    assert bind_gateway_approval_prompt(
+        session_key=session_key,
+        request_id=entry.data["request_id"],
+        platform="bluebubbles",
+        chat_id="c1",
+        prompt_message_id="prompt-origin",
+        owner_user_id="owner",
+    )
+    assert resolve_gateway_approval_by_prompt(
+        platform="bluebubbles", chat_id="c1", prompt_message_id="prompt-origin",
+        choice="once", owner_user_id="other", require_owner=True,
+    ) == 0
+    assert resolve_gateway_approval_by_prompt(
+        platform="bluebubbles", chat_id="c1", prompt_message_id="prompt-origin",
+        choice="once", owner_user_id="owner", require_owner=True,
+    ) == 1
+    _clear_approval_state()
+
+
+def test_expired_prompt_binding_resolves_nothing(monkeypatch):
+    _clear_approval_state()
+    from tools import approval as mod
+
+    session_key = "imessage-timeout-session"
+    prompt_id = "prompt-origin"
+
+    def notify(data):
+        assert mod.bind_gateway_approval_prompt(
+            session_key=session_key,
+            request_id=data["request_id"],
+            platform="imessage",
+            chat_id="c1",
+            prompt_message_id=prompt_id,
+            owner_user_id="owner",
+        )
+
+    monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 0)
+    result = mod._await_gateway_decision(
+        session_key,
+        notify,
+        {"command": "rm -rf /tmp/origin", "pattern_key": "test"},
+    )
+    assert result["resolved"] is False
+    assert mod.resolve_gateway_approval_by_prompt(
+        platform="imessage", chat_id="c1", prompt_message_id=prompt_id,
+        choice="once", owner_user_id="owner", require_owner=True,
+    ) == 0
+    _clear_approval_state()
+
+
+def test_prompt_resolution_race_consumes_once():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    source = _make_source_for(user_id="owner")
+    session_key, entry = _register_blocking_approval_for(
+        runner, source, command="rm -rf /tmp/origin"
+    )
+    from tools.approval import bind_gateway_approval_prompt, resolve_gateway_approval_by_prompt
+
+    bind_gateway_approval_prompt(
+        session_key=session_key, request_id=entry.data["request_id"],
+        platform="imessage", chat_id="c1", prompt_message_id="prompt-origin",
+        owner_user_id="owner",
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: resolve_gateway_approval_by_prompt(
+            platform="imessage", chat_id="c1", prompt_message_id="prompt-origin",
+            choice="once", owner_user_id="owner", require_owner=True,
+        ), range(2)))
+    assert sorted(results) == [0, 1]
+    assert entry.result == "once"
+    _clear_approval_state()
+
+
+def test_native_tapback_auth_uses_event_platform():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    source = _make_source_for(user_id="owner")
+    session_key, entry = _register_blocking_approval_for(
+        runner, source, command="rm -rf /tmp/origin"
+    )
+    from tools.approval import bind_gateway_approval_prompt
+
+    bind_gateway_approval_prompt(
+        session_key=session_key, request_id=entry.data["request_id"],
+        platform="telegram", chat_id="c1", prompt_message_id="prompt-origin",
+        owner_user_id="owner",
+    )
+    seen = []
+
+    def auth_check(platform):
+        seen.append(platform)
+        return lambda user_id, _chat_type, _chat_id: user_id == "owner"
+
+    runner._make_adapter_auth_check = auth_check
+    assert asyncio.run(runner._handle_native_approval_tapback(
+        platform="telegram", chat_id="c1", target_message_id="prompt-origin",
+        owner_user_id="owner",
+    ))
+    assert seen == [Platform.TELEGRAM]
     assert entry.result == "once"
     _clear_approval_state()

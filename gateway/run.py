@@ -10303,7 +10303,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve only an authenticated owner's exact approval tapback."""
         if is_group or not owner_user_id or not target_message_id:
             return False
-        auth_check = self._make_adapter_auth_check(Platform.BLUEBUBBLES)
+        try:
+            auth_platform = Platform(platform)
+        except (TypeError, ValueError):
+            return False
+        auth_check = self._make_adapter_auth_check(auth_platform)
         if not auth_check(owner_user_id, "dm", chat_id):
             return False
         from tools.approval import resolve_gateway_approval_by_prompt
