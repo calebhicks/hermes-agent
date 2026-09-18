@@ -937,9 +937,12 @@ def _approval_send_outcome(future, timeout: float) -> str:
     return outcome
 
 
-def _approval_choice_from_plaintext(text: str) -> str | None:
+def _approval_choice_from_plaintext(text: str, *, allow_thumb: bool = False) -> str | None:
     raw_text = (text or "").strip().lower()
-    if raw_text in {"approve", "yes", "ok", "okay", "confirm", "y"}:
+    once_words = {"approve", "yes", "ok", "okay", "confirm", "y"}
+    if allow_thumb:
+        once_words.add("👍")
+    if raw_text in once_words:
         return "once"
     if raw_text in {"deny", "no", "reject", "cancel", "n", "👎"}:
         return "deny"
@@ -10243,7 +10246,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[bool, Optional[str]]:
         if not event.allow_gateway_control:
             return False, None
-        choice = _approval_choice_from_plaintext(event.text)
+        choice = _approval_choice_from_plaintext(event.text, allow_thumb=True)
         reply_to_id = getattr(event, "reply_to_message_id", None)
         if not choice or not reply_to_id:
             return False, None

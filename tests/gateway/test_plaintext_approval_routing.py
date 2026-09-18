@@ -169,7 +169,7 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     _clear_approval_state()
 
 
-@pytest.mark.parametrize("reply", ["yes", "approve"])
+@pytest.mark.parametrize("reply", ["yes", "approve", "👍"])
 def test_exact_prompt_reply_resolves_originating_approval_across_sibling_session(reply):
     _clear_approval_state()
     runner, adapter = _make_runner()
