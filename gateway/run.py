@@ -939,7 +939,7 @@ def _approval_send_outcome(future, timeout: float) -> str:
 
 def _approval_choice_from_plaintext(text: str) -> str | None:
     raw_text = (text or "").strip().lower()
-    if raw_text in {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}:
+    if raw_text in {"approve", "yes", "ok", "okay", "confirm", "y"}:
         return "once"
     if raw_text in {"deny", "no", "reject", "cancel", "n", "👎"}:
         return "deny"
@@ -6209,6 +6209,7 @@ class TurnRunner:
                             platform=ctx.source.platform,
                             chat_id=ctx._status_chat_id,
                             prompt_message_id=getattr(_send_result, "message_id", None),
+                            owner_user_id=ctx.source.user_id,
                         )
                         return
                     if _outcome == "ambiguous":
@@ -6267,6 +6268,7 @@ class TurnRunner:
                             platform=ctx.source.platform,
                             chat_id=ctx._status_chat_id,
                             prompt_message_id=getattr(_text_result, "message_id", None),
+                            owner_user_id=ctx.source.user_id,
                         )
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
@@ -10253,6 +10255,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_id=event.source.chat_id,
             prompt_message_id=reply_to_id,
             choice=choice,
+            owner_user_id=event.source.user_id,
         )
         if not count:
             return False, None
@@ -10284,6 +10287,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             return True, None
         return True, reply
+
+    async def _handle_native_approval_tapback(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        target_message_id: str,
+        owner_user_id: str,
+        is_group: bool = False,
+    ) -> bool:
+        """Resolve only an authenticated owner's exact approval tapback."""
+        if is_group or not owner_user_id or not target_message_id:
+            return False
+        auth_check = self._make_adapter_auth_check(Platform.BLUEBUBBLES)
+        if not auth_check(owner_user_id, "dm", chat_id):
+            return False
+        from tools.approval import resolve_gateway_approval_by_prompt
+
+        return bool(resolve_gateway_approval_by_prompt(
+            platform=platform,
+            chat_id=chat_id,
+            prompt_message_id=target_message_id,
+            choice="once",
+            owner_user_id=owner_user_id,
+            require_owner=True,
+        ))
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---

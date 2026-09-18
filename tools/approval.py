@@ -2604,7 +2604,7 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
-_gateway_prompt_index: dict[tuple[str, str, str], tuple[str, str]] = {}
+_gateway_prompt_index: dict[tuple[str, str, str], tuple[str, str, str]] = {}
 
 
 def _approval_prompt_key(
@@ -2636,6 +2636,7 @@ def bind_gateway_approval_prompt(
     platform: object,
     chat_id: object,
     prompt_message_id: object,
+    owner_user_id: object = None,
 ) -> bool:
     """Bind a confirmed outbound approval prompt to its pending request.
 
@@ -2645,6 +2646,7 @@ def bind_gateway_approval_prompt(
     """
     session_key = str(session_key or "").strip()
     request_id = str(request_id or "").strip()
+    owner_user_id = str(owner_user_id or "").strip()
     prompt_key = _approval_prompt_key(platform, chat_id, prompt_message_id)
     if not session_key or not request_id or prompt_key is None:
         return False
@@ -2654,7 +2656,7 @@ def bind_gateway_approval_prompt(
             for entry in _gateway_queues.get(session_key, [])
         ):
             return False
-        _gateway_prompt_index[prompt_key] = (session_key, request_id)
+        _gateway_prompt_index[prompt_key] = (session_key, request_id, owner_user_id)
         return True
 
 
@@ -2664,6 +2666,8 @@ def resolve_gateway_approval_by_prompt(
     chat_id: object,
     prompt_message_id: object,
     choice: str,
+    owner_user_id: object = None,
+    require_owner: bool = False,
     reason: Optional[str] = None,
 ) -> int:
     """Resolve the exact approval request addressed by a prompt reply."""
@@ -2674,7 +2678,12 @@ def resolve_gateway_approval_by_prompt(
         target = _gateway_prompt_index.pop(prompt_key, None)
     if target is None:
         return 0
-    session_key, request_id = target
+    session_key, request_id, bound_owner_user_id = target
+    supplied_owner_user_id = str(owner_user_id or "").strip()
+    if require_owner and not bound_owner_user_id:
+        return 0
+    if bound_owner_user_id and supplied_owner_user_id != bound_owner_user_id:
+        return 0
     return resolve_gateway_approval(
         session_key,
         choice,

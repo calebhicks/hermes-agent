@@ -939,12 +939,38 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if is_from_me:
             return web.Response(text="ok")
 
-        # Skip tapback reactions delivered as messages
+        # Native 👍 tapbacks are approval input only when the authenticated
+        # adapter carries the exact target message id and sender identity.
+        # Never turn a generic/ambiguous reaction into authority.
         assoc_type = record.get("associatedMessageType")
-        if isinstance(assoc_type, int) and assoc_type in {
-            **_TAPBACK_ADDED,
-            **_TAPBACK_REMOVED,
-        }:
+        if isinstance(assoc_type, int) and assoc_type in _TAPBACK_ADDED:
+            if _TAPBACK_ADDED[assoc_type] == "like":
+                target_id = self._value(
+                    record.get("associatedMessageGuid"),
+                    record.get("associatedMessageGUID"),
+                    record.get("associatedMessageId"),
+                )
+                sender = self._value(
+                    record.get("handle", {}).get("address")
+                    if isinstance(record.get("handle"), dict) else None,
+                    record.get("sender"), record.get("from"), record.get("address"),
+                )
+                chat_id = self._value(
+                    record.get("chatGuid"), payload.get("chatGuid"),
+                    record.get("chatIdentifier"), payload.get("chatIdentifier"),
+                )
+                is_group = bool(record.get("isGroup")) or ";+;" in (chat_id or "")
+                runner = getattr(self, "gateway_runner", None)
+                if runner and chat_id and target_id and sender and not is_group:
+                    await runner._handle_native_approval_tapback(
+                        platform=self.platform.value,
+                        chat_id=chat_id,
+                        target_message_id=target_id,
+                        owner_user_id=sender,
+                        is_group=is_group,
+                    )
+            return web.Response(text="ok")
+        if isinstance(assoc_type, int) and assoc_type in _TAPBACK_REMOVED:
             return web.Response(text="ok")
 
         text = (
