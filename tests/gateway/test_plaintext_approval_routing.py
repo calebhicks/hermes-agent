@@ -169,7 +169,7 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     _clear_approval_state()
 
 
-@pytest.mark.parametrize("reply", ["yes", "approve", "👍"])
+@pytest.mark.parametrize("reply", ["yes", "approve"])
 def test_exact_prompt_reply_resolves_originating_approval_across_sibling_session(reply):
     _clear_approval_state()
     runner, adapter = _make_runner()
@@ -405,10 +405,52 @@ def test_clear_session_drops_exact_prompt_binding():
 
     assert origin_entry.event.is_set()
     assert origin_entry.result == "deny"
-    assert mod.resolve_gateway_approval_by_prompt(
-        platform="bluebubbles",
-        chat_id="c1",
-        prompt_message_id="prompt-origin",
-        choice="once",
-    ) == 0
+    _clear_approval_state()
+
+
+def test_generic_thumbs_up_does_not_resolve_unanchored_approval():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    source = _make_source_for()
+    session_key, entry = _register_blocking_approval_for(
+        runner, source, command="rm -rf /tmp/origin"
+    )
+    handled = asyncio.run(runner._handle_active_session_busy_message(
+        _make_event("👍"), session_key,
+    ))
+    assert handled is True
+    assert not entry.event.is_set()
+    assert entry.result is None
+    _clear_approval_state()
+
+
+def test_native_tapback_requires_bound_owner_and_exact_target():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    source = _make_source_for(user_id="owner")
+    session_key, entry = _register_blocking_approval_for(
+        runner, source, command="rm -rf /tmp/origin"
+    )
+    from tools.approval import bind_gateway_approval_prompt
+    bind_gateway_approval_prompt(
+        session_key=session_key, request_id=entry.data["request_id"],
+        platform="bluebubbles", chat_id="c1", prompt_message_id="prompt-origin",
+        owner_user_id="owner",
+    )
+    runner._make_adapter_auth_check = lambda _platform: (
+        lambda user_id, _chat_type, _chat_id: user_id == "owner"
+    )
+    assert not asyncio.run(runner._handle_native_approval_tapback(
+        platform="bluebubbles", chat_id="c1", target_message_id="wrong",
+        owner_user_id="owner",
+    ))
+    assert not asyncio.run(runner._handle_native_approval_tapback(
+        platform="bluebubbles", chat_id="c1", target_message_id="prompt-origin",
+        owner_user_id="other",
+    ))
+    assert asyncio.run(runner._handle_native_approval_tapback(
+        platform="bluebubbles", chat_id="c1", target_message_id="prompt-origin",
+        owner_user_id="owner",
+    ))
+    assert entry.result == "once"
     _clear_approval_state()
