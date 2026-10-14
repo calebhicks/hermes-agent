@@ -718,17 +718,6 @@ class TestSkillsInVolatileBand:
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
 
-    def test_scaffold_index_mode_reaches_prompt_builder(self):
-        agent = _make_agent(valid_tool_names=["skills_list"], _skill_index_mode="scaffold")
-        with (
-            patch("agent.prompt_builder.load_soul_md", return_value=""),
-            patch("agent.prompt_builder.build_environment_hints", return_value=""),
-            patch("agent.prompt_builder.build_context_files_prompt", return_value=_CONTEXT),
-            patch("model_tools.get_toolset_for_tool", return_value=None),
-            patch("agent.prompt_builder.build_skills_system_prompt", return_value=_SKILLS) as mock_skills,
-        ):
-            build_system_prompt_parts(agent)
-        assert mock_skills.call_args.kwargs["index_mode"] == "scaffold"
 
 
 class TestMemoryProviderSystemPromptGating:

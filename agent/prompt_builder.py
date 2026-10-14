@@ -344,7 +344,6 @@ KANBAN_GUIDANCE = (
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
 
-
 def kanban_worker_guidance(valid_tool_names) -> str:
     """Return worker lifecycle guidance only for a task-bound process."""
     return (
@@ -1370,14 +1369,13 @@ def _current_session_platform_hint() -> str:
 
 def build_skills_system_prompt(
     available_tools: set[str] | None = None, available_toolsets: set[str] | None = None,
-    compact_categories: frozenset[str] | None = None, index_mode: str = "full", skills_dir_override: Path | None = None,
+    compact_categories: frozenset[str] | None = None, skills_dir_override: Path | None = None,
 ) -> str:
     """Compact skill index for the system prompt.
 
     Same-named skills resolve like skill_view: project > local > create_dir > external_dirs, and a
     same-tier duplicate is listed under its exact relative path (``agent.skill_utils.resolve_skill_catalog``).
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
-    ``index_mode='scaffold'`` lists family categories first, then lets ``skills_list(category=...)`` reveal leaves.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
     """
@@ -1394,7 +1392,7 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not extra_roots:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories, index_mode)
+            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1443,7 +1441,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
-    compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (), index_mode: str = "full",
+    compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
     sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
@@ -1466,15 +1464,6 @@ def _render_skills_index(
     index_lines = []
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
-        if index_mode == "scaffold":
-            cat_desc = category_descriptions.get(category, "")
-            leaf_count = len({name for name, _ in entries})
-            suffix = f": {cat_desc}" if cat_desc and category not in demoted else ""
-            index_lines.append(
-                f"  - {category} ({leaf_count} leaf skill"
-                f"{'s' if leaf_count != 1 else ''}){suffix}"
-            )
-            continue
         if category in demoted:
             index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
             continue
@@ -1486,35 +1475,12 @@ def _render_skills_index(
                 seen.add(name)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
     from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
-    if is_single_query_session() and index_mode != "scaffold":
+    if is_single_query_session():
         return (
             ONESHOT_SKILLS_LOAD_GUIDANCE
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
         )
-    if index_mode == "scaffold":
-        return (
-            "## Skills (progressive disclosure)\n"
-            "Start from the user's request and the skill families below; do not inspect every leaf on every turn. "
-            "When a family could materially change your next action, call skills_list(category='...') to reveal "
-            "its leaf names and descriptions, then load the relevant leaf with skill_view(name). If the user names "
-            "a leaf skill, or you already know the exact matching leaf, load it directly without opening its family. "
-            "Expand as many families as the request actually crosses — there is no fixed skill count. Widen when "
-            "new evidence changes the task, the first route fails, or another domain becomes material; availability "
-            "alone is not a reason to load a skill. A skill already preloaded for a scheduled job is active and does "
-            "not need rediscovery. Once the requested outcome is complete, respond; do not open another family solely "
-            "to pursue adjacent follow-up work.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, or troubleshoot "
-            "Hermes Agent itself — its CLI, config, models, providers, tools, skills, voice, gateway, plugins, or any "
-            "feature — load the `hermes-agent` skill first.\n"
-            "\n"
-            "<available_skill_families>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skill_families>\n\n"
-            "All leaf skills remain available through skills_list and skill_view. Proceed without loading a leaf "
-            "when no family is materially relevant."
-        )
-
     return (
         "## Skills\n"
         "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
@@ -1546,7 +1512,6 @@ def _oneshot_prompt_variant() -> bool:
 def _build_skills_system_prompt_inner(
     skills_dir: Path, extra_roots: list[tuple[int, Path]], available_tools: set[str] | None,
     available_toolsets: set[str] | None, compact_categories: frozenset[str] | None,
-    index_mode: str,
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
@@ -1560,19 +1525,12 @@ def _build_skills_system_prompt_inner(
     manifest = _build_skills_manifest(skills_dir)
     files = frozenset((rel, *sig) for rel, sig in manifest.items())
     files |= {(str(d), rel, *sig) for _, d in extra_roots for rel, sig in _build_skills_manifest(d).items()}
-    can_expand_families = available_tools is not None and {
-        "skills_list",
-        "skill_view",
-    }.issubset(available_tools)
-    resolved_index_mode = (
-        "scaffold" if index_mode == "scaffold" and can_expand_families else "full"
-    )
     cache_key = (
         str(skills_dir), tuple((t, str(d)) for t, d in extra_roots), files,
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(), tuple(plugin_rows), resolved_index_mode,
+        _oneshot_prompt_variant(), tuple(plugin_rows),
     )
     snapshot = _load_skills_snapshot(skills_dir, manifest)
     app_gated = snapshot is not None and any(
@@ -1642,7 +1600,7 @@ def _build_skills_system_prompt_inner(
             logger.debug("Could not write skills prompt snapshot: %s", e)
 
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable, resolved_index_mode)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
