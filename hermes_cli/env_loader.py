@@ -685,7 +685,7 @@ def resolve_deferred_secret(name: str) -> str | None:
             _DEFERRED_RELOAD_HOMES.discard(key)
             try:
                 cfg = _load_secrets_config(home)
-            except Exception:
+            except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
                 return
             if not _can_defer_onepassword(cfg):
                 _DEFERRED_ONEPASSWORD.pop(key, None)
@@ -704,11 +704,7 @@ def resolve_deferred_secret(name: str) -> str | None:
         return _SECRET_SOURCE_VALUES_BY_HOME.get(key, {}).get(name)
 
 
-def _apply_external_secret_sources(home_path: Path, *, selected: dict | None = None) -> None:
-    """Pull secrets from every enabled external source into env — AFTER dotenv (sources need .env bootstrap
-    tokens), BEFORE Hermes reads credentials; failures never block startup. Precedence/conflicts/provenance
-    live in ``registry.apply_all``; this wrapper owns the once-per-home guard, the post-apply ASCII sweep,
-    the ``_SECRET_SOURCES`` map and status lines."""
+def _selected_secret_sources(home_path: Path, selected: dict | None) -> dict | None:
     home_key = str(Path(home_path).resolve())
     if selected is None and home_key in _APPLIED_HOMES:
         return
@@ -718,7 +714,7 @@ def _apply_external_secret_sources(home_path: Path, *, selected: dict | None = N
     # load (the signature-cached read is cheap).
     try:
         cfg = selected if selected is not None else _load_secrets_config(home_path)
-    except Exception:  # noqa: BLE001 — config errors must not block startup
+    except Exception:  # health: allow BLE001 -- Native startup keeps the previous credentials on unreadable config; never log secret-bearing parse text.
         # See #40597.
         return
     # No source configured / enabled any more: whatever one wrote earlier is no longer backed (#126982
@@ -735,6 +731,19 @@ def _apply_external_secret_sources(home_path: Path, *, selected: dict | None = N
         _DEFERRED_ONEPASSWORD.pop(home_key, None)
         _DEFERRED_ATTEMPTS.pop(home_key, None)
         _DEFERRED_RELOAD_HOMES.discard(home_key)
+
+    return cfg
+
+
+def _apply_external_secret_sources(home_path: Path, *, selected: dict | None = None) -> None:
+    """Pull secrets from every enabled external source into env — AFTER dotenv (sources need .env bootstrap
+    tokens), BEFORE Hermes reads credentials; failures never block startup. Precedence/conflicts/provenance
+    live in ``registry.apply_all``; this wrapper owns the once-per-home guard, the post-apply ASCII sweep,
+    the ``_SECRET_SOURCES`` map and status lines."""
+    home_key = str(Path(home_path).resolve())
+    cfg = _selected_secret_sources(home_path, selected)
+    if cfg is None:
+        return
 
     # Defer the registry import until a source is enabled — bitwarden eagerly loads cryptography._rust.pyd,
     # which makes the Windows updater self-lock before its preflight. Detect by *shape* (dict with enabled

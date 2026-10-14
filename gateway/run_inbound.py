@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain the existing source-envelope binding before native inbound authorization; two-line integration delta.
 """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.

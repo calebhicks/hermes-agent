@@ -9,7 +9,7 @@ from agent import relay_runtime
 from agent.delegation_context import delegated_child_context
 from gateway import session_context
 from hermes_cli import goals
-from tools import goal_control_tool  # noqa: F401
+from tools import goal_control_tool
 from tools.registry import registry
 
 

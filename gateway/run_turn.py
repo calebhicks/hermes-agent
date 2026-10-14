@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain verified adapter session hooks around native turn preparation and fail closed on their errors.
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
 background tasks, MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
@@ -2058,7 +2059,7 @@ class GatewayTurnMixin:
             if adapter is not None:
                 try:
                     start_context = await adapter.session_start_context(event)
-                except Exception:
+                except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
                     logger.warning(
                         "Platform session-start context hook failed category=adapter_exception"
                     )
@@ -2075,7 +2076,7 @@ class GatewayTurnMixin:
             if adapter is not None:
                 try:
                     resume_context = str(await adapter.session_resume_context(source) or "")
-                except Exception:
+                except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
                     logger.warning(
                         "Platform session-resume context hook failed category=adapter_exception"
                     )

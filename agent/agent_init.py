@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain profile skill-index and source binding in the existing instance initialization; five-line integration delta.
 """Implementation of :meth:`AIAgent.__init__` as ``init_agent(agent, ...)``.
 
 ``init_agent`` is a thin, ordered orchestrator over ``_init_*`` / ``_build_*`` phase

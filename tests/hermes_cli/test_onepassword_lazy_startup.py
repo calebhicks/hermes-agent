@@ -155,7 +155,7 @@ def test_second_source_and_aliases_decline_deferral(lazy_profile):
 
 
 def test_override_false_keeps_existing_value(lazy_profile, monkeypatch):
-    home, settings, calls = lazy_profile
+    home, settings, _calls = lazy_profile
     settings['onepassword']['override_existing'] = False
     (home / 'config.yaml').write_text(json.dumps({'secrets': settings}))
     monkeypatch.setenv('TEST_LAZY_KEY', 'inherited')
@@ -199,8 +199,8 @@ def test_cancel_first_use_does_not_spawn_transport_or_block_loop(monkeypatch):
         server = mcp_tool.MCPServerTask('cancel')
         task = asyncio.create_task(server.start(mcp_tool_config.DeferredMCPConfig({'command': 'fake'})))
         try:
-            while not entered.is_set():
-                await asyncio.sleep(.001)
+            from tests.waiting import async_wait_until
+            await async_wait_until(entered.is_set, timeout=3)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task

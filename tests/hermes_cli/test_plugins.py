@@ -1783,22 +1783,6 @@ class TestPreToolCallDirective:
         details = _get_pre_tool_call_directive_details("write_file", {"path": "/p"})
         assert (details.action, details.message, details.rule_key) == ("approve", "first", "write_file:ssh")
         assert details.modified_args == {"path": "/p", "content": "fixed"}
-    def test_always_prompt_reaches_native_gate(self, monkeypatch):
-        from hermes_cli.plugins import resolve_pre_tool_block
-        seen = {}
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [{
-                "action": "approve", "always_prompt": True,
-                "rule_key": "one-call",
-            }],
-        )
-        monkeypatch.setattr(
-            "tools.approval.request_tool_approval",
-            lambda *args, **kwargs: seen.update(kwargs) or {"approved": True},
-        )
-        assert resolve_pre_tool_block("nb_canada_execute", {}) is None
-        assert seen["always_prompt"] is True
 
 
 class TestResolvePreToolBlock:

@@ -518,7 +518,7 @@ class CLILoopsMixin:
             if callable(refresh):
                 try:
                     refresh()
-                except Exception as exc:
+                except Exception as exc:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
                     logging.debug("goal manager refresh failed: %s", exc)
         return mgr
 

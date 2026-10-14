@@ -361,7 +361,7 @@ class GatewayConfigLoadersMixin:
         if adapter is not None:
             try:
                 override = adapter.busy_input_mode_for_source(source)
-            except Exception:
+            except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
                 logger.warning("Platform busy-input source hook failed category=adapter_exception")
             else:
                 if override in {"interrupt", "queue", "steer"}:

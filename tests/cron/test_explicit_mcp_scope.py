@@ -20,7 +20,7 @@ def test_per_job_mcp_scope_survives_server_loss_and_keeps_explicit_grants():
 
 
 def test_implicit_cron_failure_never_becomes_default_tools_for_managed_profile(monkeypatch):
-    import hermes_cli.tools_config as tools_config
+    from hermes_cli import tools_config
     def broken(*args, **kwargs):
         raise ValueError("fixture resolution failure")
     monkeypatch.setattr(tools_config, "_get_platform_tools", broken)

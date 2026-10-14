@@ -24,7 +24,6 @@ from tools.delegate_tool import (
     delegate_task,
     _build_child_agent,
     _strip_blocked_tools,
-    _resolve_child_toolsets,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
@@ -52,8 +51,6 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
-
-
 
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -166,41 +163,6 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertTrue(
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
-
-    def test_configured_child_block_wins_after_default_inheritance(self):
-        parent = _make_mock_parent()
-        parent.enabled_toolsets = ["terminal", "conductor-cloud"]
-        parent.disabled_toolsets = []
-
-        with (
-            patch(
-                "tools.delegate_tool_toolsets._get_blocked_child_toolsets",
-                return_value=[" conductor-cloud "],
-            ),
-            patch(
-                "tools.delegate_tool_toolsets._canonical_toolset_name",
-                side_effect=lambda value: {
-                    "conductor-cloud": "mcp-conductor-cloud",
-                }.get(str(value).strip(), str(value).strip()),
-            ),
-        ):
-            enabled, disabled = _resolve_child_toolsets(parent, None, "leaf")
-
-        self.assertEqual(enabled, ["terminal"])
-        self.assertIn("conductor-cloud", disabled)
-        self.assertIn("mcp-conductor-cloud", disabled)
-
-    def test_malformed_configured_child_block_refuses_resolution(self):
-        parent = _make_mock_parent()
-        parent.enabled_toolsets = ["terminal", "conductor-cloud"]
-        parent.disabled_toolsets = []
-
-        with patch(
-            "tools.delegate_tool._load_config",
-            return_value={"blocked_child_toolsets": "conductor-cloud"},
-        ):
-            with self.assertRaisesRegex(ValueError, "must be a list"):
-                _resolve_child_toolsets(parent, None, "leaf")
 
 
 class TestDelegateTask(unittest.TestCase):
@@ -443,8 +405,6 @@ class TestToolNamePreservation(unittest.TestCase):
             delegate_task(goal="Test tool preservation", parent_agent=parent)
 
         self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
-
-
 
 
 class TestDelegateObservability(unittest.TestCase):

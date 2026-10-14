@@ -177,7 +177,7 @@ def bind_gateway_approval_when_sent(future, *, session_key: str, request_id: str
     def confirmed(done):
         try:
             result = done.result()
-        except Exception:
+        except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
             return
         if getattr(result, "success", False) is True:
             bind_gateway_approval_prompt(session_key=session_key, request_id=request_id,

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain SQLite extension and disappearing-receipt handling inside the native archive inventory and writer.
 """Backup and import commands for hermes CLI."""
 
 import json

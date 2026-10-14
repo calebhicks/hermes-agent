@@ -567,7 +567,7 @@ class TestClientTools:
         hops = []
 
         class Redirector(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
+            def do_GET(self):
                 hops.append(self.path)
                 self.send_response(307)
                 self.send_header("Location", "http://169.254.169.254/latest/meta-data/")

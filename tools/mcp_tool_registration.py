@@ -477,7 +477,7 @@ def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False
             config = _config._interpolate_env_vars(config)
         if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
             return False
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
         logger.warning("MCP connection identity unavailable (%s)", type(exc).__name__)
         return False
     if not cross_profile:

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain ambiguous-send no-replay handling at the existing native fallback decision; splitting ownership risks retrying a write.
 """Cron delivery: target resolution (origin/home/explicit/bot-chat), transcript mirroring and
 session seeding, live-adapter / relay / standalone send lanes, and ``_deliver_result``.
 

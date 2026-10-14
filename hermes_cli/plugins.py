@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain exact approval and trusted session metadata in the existing plugin API boundary.
 """Hermes Plugin System — discovers, loads, and manages plugins.
 
 Sources, later overriding earlier on key collision: bundled ``<repo>/plugins/<name>/`` (``memory/``

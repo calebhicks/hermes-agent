@@ -104,7 +104,7 @@ _OPENER = urllib.request.build_opener(_RefuseRedirects)
 
 def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None) -> dict:
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 (allowlisted peers, no redirects)
+    with _OPENER.open(req, timeout=timeout) as resp:  # Allowlisted peers; redirects disabled.
         return json.loads(resp.read().decode("utf-8"))
 
 

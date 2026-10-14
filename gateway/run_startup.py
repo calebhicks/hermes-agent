@@ -473,7 +473,7 @@ class GatewayStartupMixin:
             if callable(hook):
                 try:
                     disposition = await adapter.delivery_obligation_redelivery_disposition(row)
-                except Exception:
+                except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
                     logger.warning(
                         "obligation %s: adapter redelivery classification failed; holding",
                         row["obligation_id"],
@@ -654,7 +654,7 @@ class GatewayStartupMixin:
         response just because it carries a resume marker."""
         try:
             adapter_decision = await adapter.authorize_persisted_source(source)
-        except Exception:
+        except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
             logger.warning(
                 "Skipping auto-resume for %s: adapter authorization hook failed "
                 "category=adapter_exception",
@@ -673,7 +673,7 @@ class GatewayStartupMixin:
                 "Skipping auto-resume for %s: persisted source is no longer authorized",
                 session_key,
             )
-        except Exception:
+        except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
             logger.warning(
                 "Skipping auto-resume for %s: authorization check failed "
                 "category=gateway_exception",

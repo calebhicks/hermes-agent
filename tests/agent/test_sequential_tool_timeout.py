@@ -323,7 +323,7 @@ def test_sequential_timeout_does_not_cut_clarify_human_wait(
     def _callback(questions):
         # Must OUTLAST the 1.0s sequential deadline — the test proves the
         # generic timeout never cuts a human clarify wait.
-        time.sleep(1.3)
+        time.sleep(1.3)  # health: allow HX013 -- Deliberately outlast the generic one-second timeout to prove the relay owns its human-wait expiry.
         return {"answers": {"q0": "A"}, "outcome": "submitted"}
 
     agent.clarify_callback = _callback
@@ -370,7 +370,7 @@ def test_sequential_timeout_does_not_cut_conductor_relay_human_wait(
 
     def _dispatch(name, _args, _task_id, *, tool_call_id, **_kwargs):
         if name == "mcp__conductor_caleb_relay__ask_caleb":
-            time.sleep(1.3)
+            time.sleep(1.3)  # health: allow HX013 -- Deliberately outlast the generic one-second timeout to prove the relay owns its human-wait expiry.
             return "human reply"
         return "second result"
 

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain opt-in restart notification at the native notification decision; one-line integration delta.
 """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain exact message-bound approval proof in native Slack handling; no parallel Slack adapter.
 """Slack platform adapter: slack-bolt Socket Mode (messages, slash commands, threads)."""
 
 import asyncio

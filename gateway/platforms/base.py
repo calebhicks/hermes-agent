@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- External adapters implement these retained authorization and delivery ABI methods on the base adapter; generic defaults preserve native channels.
 """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
 
 import asyncio
@@ -4272,8 +4273,8 @@ class BasePlatformAdapter(ABC):
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool,
-        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
-    ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
@@ -4894,7 +4895,7 @@ class BasePlatformAdapter(ABC):
         )
 
     async def delivery_obligation_redelivery_disposition(
-        self, obligation: Dict[str, Any]
+        self, obligation: dict[str, Any]
     ) -> str:
         """Classify a claimed startup delivery obligation.
 

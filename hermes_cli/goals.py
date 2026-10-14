@@ -1176,7 +1176,7 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
-    def _adopt_external_change(self, expected_json: str) -> Optional[Dict[str, Any]]:
+    def _adopt_external_change(self, expected_json: str) -> Optional[dict[str, Any]]:
         """Return a stop decision if another writer changed this goal mid-evaluation."""
         current = load_goal(self.session_id)
         current_json = current.to_json() if current is not None else ""

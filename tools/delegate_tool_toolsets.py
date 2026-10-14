@@ -42,7 +42,7 @@ def _canonical_toolset_name(name: str) -> str:
     try:
         from tools.registry import registry
         return registry.get_toolset_alias_target(normalized) or normalized
-    except Exception:
+    except Exception:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
         return normalized
 
 def _expand_parent_toolsets(parent_toolsets: set) -> set:

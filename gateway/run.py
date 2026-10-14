@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain exact approval delivery confirmation at its existing gateway callback owner.
 """Gateway runner - entry point for messaging platform integrations.
 
 Provides ``start_gateway()`` (start all configured adapters) and ``GatewayRunner`` (lifecycle).
@@ -772,7 +773,7 @@ def _approval_send_result(future, timeout: float) -> tuple[str, Any]:
         result = future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         return "ambiguous", None
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 S110 -- Fail closed at the retained extension boundary; exception text may contain private session or credential data.
         logger.warning("Prompt send failed: %s", exc)
         return "failed", None
     if getattr(result, "success", False):

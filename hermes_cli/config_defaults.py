@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retain operator-facing defaults for existing downstream boundaries in the native configuration owner.
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing

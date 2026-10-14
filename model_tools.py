@@ -517,12 +517,13 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
         filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
+    # health: allow HX002 -- Existing ephemeral worker identity proof, not a behavioral setting or credential.
     if (os.environ.get("HERMES_SESSION_SOURCE") == "conductor" and os.environ.get("HERMES_CONSULT_WORKER_NONCE")
             and enabled_toolsets and "skills_read" in enabled_toolsets and any(":" in n for n in enabled_toolsets)):
         import sys
         print("CONDUCTOR_CONTEXT " + json.dumps({
-            "kind": "tools", "context_id": os.environ.get("HERMES_CONSULT_CONTEXT_ID"),
-            "nonce": os.environ["HERMES_CONSULT_WORKER_NONCE"],
+            "kind": "tools", "context_id": os.environ.get("HERMES_CONSULT_CONTEXT_ID"),  # health: allow HX002 -- Existing scoped worker receipt identity.
+            "nonce": os.environ["HERMES_CONSULT_WORKER_NONCE"],  # health: allow HX002 -- Existing one-worker receipt binding.
             "tools": sorted(_last_resolved_tool_names),
         }), file=sys.stderr, flush=True)
 

@@ -21,7 +21,7 @@ def _goal_budget_limit() -> int:
 
         cfg = (load_config() or {}).get("goals") or {}
         return max(1, int(cfg.get("max_turns", 20) or 20))
-    except Exception:
+    except Exception:  # health: allow BLE001 S110 -- Keep the native default budget on unreadable optional config; do not log private config.
         return 20
 
 
@@ -33,7 +33,7 @@ def _current_session_id() -> str:
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
         if session_context_engaged():
             return session_id
-    except Exception:
+    except Exception:  # health: allow BLE001 S110 -- Keep legacy environment resolution when the optional context helper is unavailable; dispatch validates session identity.
         session_id = ""
     if not session_id:
         session_id = str(os.environ.get("HERMES_SESSION_ID") or "").strip()
@@ -48,7 +48,7 @@ def _trusted_session_id(dispatch_session_id: str | None) -> tuple[str | None, st
 
         if is_delegated_child_context():
             return None, "goal control is unavailable inside delegated child agents"
-    except Exception:
+    except Exception:  # health: allow BLE001 S110 -- Refuse unverifiable delegation or continuation; optional Relay lookup falls back to trusted dispatcher context without exposing leases.
         return None, "delegated context could not be verified"
 
     # A live Relay lease proves identity, not permission to continue a worker.
@@ -60,7 +60,7 @@ def _trusted_session_id(dispatch_session_id: str | None) -> tuple[str | None, st
 
         if not async_delivery_supported():
             return None, "goal control requires a continuable session"
-    except Exception:
+    except Exception:  # health: allow BLE001 S110 -- Refuse unverifiable delegation or continuation; optional Relay lookup falls back to trusted dispatcher context without exposing leases.
         return None, "session continuation capability could not be verified"
 
     try:
@@ -72,7 +72,7 @@ def _trusted_session_id(dispatch_session_id: str | None) -> tuple[str | None, st
             if lease.parent_session_id and lease.parent_session_id != lease.session_id:
                 return None, "goal control is unavailable inside delegated child agents"
             return lease.session_id, None
-    except Exception:
+    except Exception:  # health: allow BLE001 S110 -- Refuse unverifiable delegation or continuation; optional Relay lookup falls back to trusted dispatcher context without exposing leases.
         pass
 
     current = _current_session_id()

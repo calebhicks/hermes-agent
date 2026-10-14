@@ -176,7 +176,7 @@ def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     return is_truthy_value(_cfg().get("inherit_mcp_toolsets"), default=True)
 
-def _get_blocked_child_toolsets() -> List[str]:
+def _get_blocked_child_toolsets() -> list[str]:
     """Toolsets that delegation must never pass to a child.
 
     This is an operator-owned denylist, applied after inheritance and role
