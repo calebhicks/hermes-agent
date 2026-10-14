@@ -515,6 +515,14 @@ def _import_db_member(
     caller reports a skipped file instead of counting a silent success.
     """
     if not target.exists():
+        from hermes_cli.backup import _atomic_output_path, verify_sqlite_integrity
+
+        sidecars = [target.with_name(target.name + suffix) for suffix in ("-wal", "-shm", "-journal")]
+        if target.is_symlink() or any(path.exists() or path.is_symlink() for path in sidecars):
+            raise OSError(
+                f"missing database {target.name} has a symlink or retained sidecars; "
+                "preserve and reconcile the recovery evidence before importing"
+            )
         # "Missing" is not "unheld": a gateway or dashboard that had the database open when it
         # was unlinked still writes the deleted inode (the ``(deleted)`` fingerprint of #90950).
         # Publishing a fresh inode here re-creates the same split brain the branch below exists
@@ -526,7 +534,11 @@ def _import_db_member(
                 f"{', '.join(str(pid) for pid in sorted(holders))}; publishing a new file would "
                 "leave them writing an invisible database. Stop those processes and re-run the import."
             )
-        _extract_member_atomically(zf, member, target, new_file_mode)
+        with _atomic_output_path(target) as candidate:
+            _extract_member_atomically(zf, member, candidate, new_file_mode)
+            result = verify_sqlite_integrity(candidate, max_bytes=0)
+            if not result["valid"]:
+                raise OSError(f"invalid SQLite archive member {member}: {result['message']}")
         return
 
     # The database keeps its own mode/ownership: the bytes come from the

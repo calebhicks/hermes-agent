@@ -29,6 +29,12 @@ def _no_real_gateway_service(monkeypatch):
     monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
 
 
+def _valid_sqlite_bytes():
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute("CREATE TABLE fixture(identity TEXT PRIMARY KEY)")
+        return connection.serialize()
+
+
 def _advance_backup_clock(seconds: float = 1.1) -> None:
     """Skew hermes_cli.backup's datetime forward instead of sleeping.
 
@@ -815,7 +821,7 @@ class TestImport:
             "config.yaml": "model: openrouter\n",
             ".env": "OPENROUTER_API_KEY=sk-secret\n",
             "auth.json": '{"providers": {"nous": "token"}}',
-            "state.db": b"SQLite format 3\x00",
+            "state.db": _valid_sqlite_bytes(),
             "profiles/coder/.env": "ANTHROPIC_API_KEY=sk-ant-secret\n",
         })
 
@@ -990,7 +996,7 @@ class TestBackupEdgeCases:
         assert not (tmp_path / "out.zip").exists()
 
 
-    def test_pre1980_timestamp_skipped(self, tmp_path, monkeypatch):
+    def test_pre1980_timestamp_preserves_file_bytes(self, tmp_path, monkeypatch):
         """Backup skips files with pre-1980 timestamps (ZIP limitation)."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -1015,8 +1021,9 @@ class TestBackupEdgeCases:
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()
             assert "config.yaml" in names
-            # The pre-1980 file should be skipped, not crash the backup
-            assert "ancient.txt" not in names
+            # ZIP timestamp clamping must not drop the file.
+            assert zf.read("ancient.txt") == b"old data"
+            assert zf.getinfo("ancient.txt").date_time[0] == 1980
 
 
 
@@ -1115,11 +1122,11 @@ class TestImportAtomicWrites:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         zip_path = tmp_path / "backup.zip"
-        self._zip(zip_path, {"config.yaml": "model: replacement\n", "state.db": ""})
+        self._zip(zip_path, {"config.yaml": "model: replacement\n", "state.db": _valid_sqlite_bytes()})
         _break_member(monkeypatch, "config.yaml")
 
         from hermes_cli.backup import run_import
-        run_import(Namespace(zipfile=str(zip_path), force=True))
+        assert run_import(Namespace(zipfile=str(zip_path), force=True)) == 1
 
         # Pre-fix this file is 0 bytes: the truncate landed, the write did not.
         assert (hermes_home / "config.yaml").read_text() == original
@@ -1148,7 +1155,7 @@ class TestImportAtomicWrites:
         _break_member(monkeypatch, "_external/.honcho/config.json")
 
         from hermes_cli.backup import run_import
-        run_import(Namespace(zipfile=str(zip_path), force=True))
+        assert run_import(Namespace(zipfile=str(zip_path), force=True)) == 1
 
         assert (honcho / "config.json").read_text() == original
         assert list(honcho.glob(".config.json.*")) == []
@@ -1174,7 +1181,7 @@ class TestImportAtomicWrites:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         zip_path = tmp_path / "backup.zip"
-        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": ""})
+        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": _valid_sqlite_bytes()})
 
         from hermes_cli.backup import run_import
         run_import(Namespace(zipfile=str(zip_path), force=True))
@@ -1230,7 +1237,7 @@ class TestImportAtomicWrites:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         zip_path = tmp_path / "backup.zip"
-        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": ""})
+        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": _valid_sqlite_bytes()})
 
         from hermes_cli.backup import run_import
         run_import(Namespace(zipfile=str(zip_path), force=True))
@@ -1255,7 +1262,7 @@ class TestImportAtomicWrites:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         zip_path = tmp_path / "backup.zip"
-        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": ""})
+        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": _valid_sqlite_bytes()})
 
         chown_calls: list[tuple[Path, int, int]] = []
         monkeypatch.setattr(
@@ -1287,7 +1294,7 @@ class TestImportAtomicWrites:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         zip_path = tmp_path / "backup.zip"
-        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": ""})
+        self._zip(zip_path, {"config.yaml": "model: restored\n", "state.db": _valid_sqlite_bytes()})
 
         import hermes_cli.backup_restore as backup_mod
 
@@ -1339,7 +1346,7 @@ class TestImportAtomicWrites:
         zip_path = tmp_path / "backup.zip"
         self._zip(
             zip_path,
-            {"helper.sh": "#!/bin/sh\necho attacker\n", "state.db": ""},
+            {"helper.sh": "#!/bin/sh\necho attacker\n", "state.db": _valid_sqlite_bytes()},
         )
 
         import hermes_cli.backup_restore as backup_mod
@@ -2516,7 +2523,7 @@ class TestMemoryProviderExternalPaths:
         with zipfile.ZipFile(zip_path, "w") as zf:
             zf.writestr("config.yaml", "model: {}\n")
             zf.writestr(".env", "X=1\n")
-            zf.writestr("state.db", "")
+            zf.writestr("state.db", _valid_sqlite_bytes())
             zf.writestr("_external/.honcho/config.json", '{"peer":"bob"}')
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))

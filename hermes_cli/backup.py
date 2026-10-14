@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -120,7 +121,16 @@ def _in_excluded_root_dir(rel_path: Path) -> bool:
 # SQLite sidecars are excluded because ``*.db`` is snapshotted via ``sqlite3.backup()``:
 # shipping the live WAL/SHM/journal alongside would pair a fresh snapshot with stale sidecar
 # state and produce a torn restore on next open. They are regenerated on first connection.
-_SQLITE_SIDECAR_SUFFIXES = (".db-wal", ".db-shm", ".db-journal")
+_SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+_SQLITE_SIDECAR_SUFFIXES = tuple(
+    extension + sidecar for extension in _SQLITE_SUFFIXES
+    for sidecar in ("-wal", "-shm", "-journal")
+)
+
+
+def _is_sqlite_path(path: Path) -> bool:
+    return path.suffix.lower() in _SQLITE_SUFFIXES
+
 _EXCLUDED_SUFFIXES = (".pyc", ".pyo", *_SQLITE_SIDECAR_SUFFIXES)
 
 # File names to skip (runtime state that's meaningless on another machine)
@@ -281,7 +291,7 @@ def _iter_external_files(base: Path) -> list[Path]:
         dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
         files.extend(fp for fp in (Path(dirpath) / f for f in filenames)
                      if not (_is_non_regular_path(fp) or fp.name in _EXCLUDED_NAMES
-                             or fp.name.endswith(_EXCLUDED_SUFFIXES)))
+                             or (fp.name.endswith(_EXCLUDED_SUFFIXES) or fp.name.lower().endswith(_SQLITE_SIDECAR_SUFFIXES))))
     return files
 
 
@@ -319,7 +329,7 @@ def _should_exclude(rel_path: Path) -> bool:
     if any(p in _EXCLUDED_DIRS and (p != "hermes-agent" or p == parts[0]) for p in parts):
         return True
     name = rel_path.name
-    return name in _EXCLUDED_NAMES or name.startswith(_EXCLUDED_PREFIXES) or name.endswith(_EXCLUDED_SUFFIXES)
+    return name in _EXCLUDED_NAMES or name.startswith(_EXCLUDED_PREFIXES) or (name.endswith(_EXCLUDED_SUFFIXES) or name.lower().endswith(_SQLITE_SIDECAR_SUFFIXES))
 
 
 def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional[set] = None):
@@ -502,6 +512,15 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
         tmp_db.unlink(missing_ok=True)
 
 
+def _is_expiring_process_result(relative: Path) -> bool:
+    """Only native process-result receipts are concurrently pruned (7 days / 64 rows)."""
+    parts = relative.parts
+    if len(parts) == 5 and parts[0] == "profiles":
+        parts = parts[2:]
+    return (len(parts) == 3 and parts[:2] == ("logs", "process-results")
+            and re.fullmatch(r"proc_[\w]+\.json", parts[2]) is not None)
+
+
 def _write_zip_entries(
     zf: zipfile.ZipFile, files_to_add: list[tuple[Path, Path]], out_path: Path,
     *, on_db_failure, on_error, on_progress, track_bytes: bool) -> int:
@@ -514,7 +533,7 @@ def _write_zip_entries(
     total_bytes = 0
     for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
         try:
-            if abs_path.suffix == ".db":
+            if _is_sqlite_path(abs_path):
                 size = _zip_sqlite_snapshot(zf, abs_path, rel_path, out_path)
                 if size is None:
                     on_db_failure(rel_path)
@@ -523,7 +542,13 @@ def _write_zip_entries(
             else:
                 _write_zip_file(zf, abs_path, str(rel_path))
                 if track_bytes:
-                    total_bytes += abs_path.stat().st_size
+                    total_bytes += zf.getinfo(str(rel_path)).file_size
+        except FileNotFoundError as exc:
+            if _is_expiring_process_result(rel_path):
+                logger.info("backup expired process-result receipt: %s", rel_path)
+            else:
+                on_error(rel_path, exc)
+            continue
         except (PermissionError, OSError, ValueError) as exc:
             on_error(rel_path, exc)
             continue
@@ -635,7 +660,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         logger.info("backup phase=archive status=progress completed=%d total=%d", i, file_count)
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False) as zf:
         total_bytes = _write_zip_entries(
             zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
@@ -645,7 +670,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         for abs_path, arcname in external_to_add:
             try:
                 _write_zip_file(zf, abs_path, arcname)
-                total_bytes += abs_path.stat().st_size
+                total_bytes += zf.getinfo(arcname).file_size
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"{arcname}: {exc}")
     elapsed = time.monotonic() - t0
@@ -713,7 +738,7 @@ def _import_skipped(rel: str) -> bool:
         return False  # A rejected traversal is still reported by the import itself.
     return (parts[-1] in _IMPORT_SKIP_NAMES or
             profile_root_entry(parts) in PM_RUNTIME_ROOT_DIRS or
-            rel.endswith(_SQLITE_SIDECAR_SUFFIXES))
+            rel.lower().endswith(_SQLITE_SIDECAR_SUFFIXES))
 
 
 def _import_member_rel(member: str, prefix: str) -> tuple[str, bool]:
@@ -878,7 +903,7 @@ def run_import(args) -> Optional[int]:
             # a live sidecar, via os.replace) would replay a foreign WAL on
             # the next open. Current backups never ship these
             # (_EXCLUDED_SUFFIXES); older or hand-built archives might.
-            if rel.endswith(_SQLITE_SIDECAR_SUFFIXES):
+            if rel.lower().endswith(_SQLITE_SIDECAR_SUFFIXES):
                 skipped_runtime.append(rel)
                 continue
 
@@ -893,7 +918,7 @@ def run_import(args) -> Optional[int]:
 
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if target.suffix == ".db":
+                if _is_sqlite_path(target):
                     # Count before the write: afterwards the rows this import
                     # drops are gone and there is nothing left to compare.
                     before = _count_session_rows(target)
@@ -1303,7 +1328,7 @@ def _create_quick_snapshot_locked(
                 if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
                     continue
                 if _too_large(sub, sub_rel):
-                    if sub.suffix == ".db":
+                    if _is_sqlite_path(sub):
                         oversized_skipped.append(sub_rel)
                     continue
                 dst = staging_dir / sub_rel
@@ -1312,7 +1337,7 @@ def _create_quick_snapshot_locked(
                     # Route SQLite DBs through the WAL-safe backup() path so a
                     # board DB with an open WAL (the gateway may hold it at
                     # snapshot time) is captured consistently.
-                    if sub.suffix == ".db":
+                    if _is_sqlite_path(sub):
                         if not _safe_copy_db(sub, dst):
                             failed_dbs.append(sub_rel)
                             print(
@@ -1336,7 +1361,7 @@ def _create_quick_snapshot_locked(
             continue
 
         if _too_large(src, rel):
-            if src.suffix == ".db":
+            if _is_sqlite_path(src):
                 oversized_skipped.append(rel)
             continue
 
@@ -1344,7 +1369,7 @@ def _create_quick_snapshot_locked(
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            if src.suffix == ".db":
+            if _is_sqlite_path(src):
                 if not _safe_copy_db(src, dst):
                     failed_dbs.append(rel)
                     print(
@@ -2258,7 +2283,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     archive_started = time.monotonic()
     try:
         with _atomic_output_path(out_path, _publish_path) as archive_path, zipfile.ZipFile(
-                archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False) as zf:
             _write_zip_entries(
                 zf, files_to_add, out_path, on_db_failure=_db_failure, track_bytes=False,
                 on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
