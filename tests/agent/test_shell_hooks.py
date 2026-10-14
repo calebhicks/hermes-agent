@@ -57,6 +57,24 @@ class TestParseResponse:
         """The documented ``approve`` action used to parse to None, so the tool ran with no
         approval prompt (#92553). It now yields the same shape Python plugins return."""
         assert shell_hooks._parse_response("pre_tool_call", stdout) == expected
+    def test_uncacheable_approval_fields_are_preserved(self):
+        r = shell_hooks._parse_response(
+            "pre_tool_call",
+            json.dumps({
+                "action": "approve",
+                "message": "one call",
+                "rule_key": "nb:call-1",
+                "always_prompt": True,
+            }),
+        )
+        assert r == {
+            "action": "approve",
+            "message": "one call",
+            "rule_key": "nb:call-1",
+            "always_prompt": True,
+        }
+
+
 
     def test_empty_stdout_returns_none(self):
         assert shell_hooks._parse_response("pre_tool_call", "") is None

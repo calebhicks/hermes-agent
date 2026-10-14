@@ -440,7 +440,8 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     silently drops every MCP server). Mirrors ``_get_platform_tools``: ``no_mcp`` sentinel -> none
     (stripped); any MCP server already listed -> allowlist, add nothing; else union all enabled."""
     result = [t for t in per_job if t != "no_mcp"]
-    if "no_mcp" in per_job:
+    from hermes_cli.tools_config import _mcp_explicit_toolsets_only
+    if _mcp_explicit_toolsets_only(cfg) or "no_mcp" in per_job:
         return result
     # lazy: avoid heavy hermes_cli import at module load; shares MCP-membership with gateway/CLI
     from hermes_cli.tools_config import enabled_mcp_server_names

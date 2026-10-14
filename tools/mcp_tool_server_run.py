@@ -524,6 +524,12 @@ class MCPServerRunMixin:
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
+        from tools.mcp_tool_config import DeferredMCPConfig, _interpolate_env_vars, _warn_hidden_whitespace
+        if isinstance(config, DeferredMCPConfig):
+            # op reads are synchronous and bounded; do not block the shared MCP
+            # event loop. No transport/task exists if this await is cancelled.
+            config = await asyncio.to_thread(_interpolate_env_vars, config)
+            _warn_hidden_whitespace(self.name, config)
         self._task = asyncio.ensure_future(self.run(config))
         try:
             await self._ready.wait()

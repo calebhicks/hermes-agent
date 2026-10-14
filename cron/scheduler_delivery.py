@@ -260,7 +260,14 @@ def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Opt
     create_thread = getattr(adapter, "create_handoff_thread", None)
     if not callable(create_thread) or loop is None:
         return None
-    thread_name = f"Hermes — {_cron_display_name(job)}"
+    task_name = _cron_display_name(job)
+    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+    requested_title = origin.get("thread_title")
+    thread_name = (
+        requested_title.strip()
+        if isinstance(requested_title, str) and requested_title.strip()
+        else f"Hermes — {task_name}"
+    )
     try:
         from agent.async_utils import safe_schedule_threadsafe
         coro = create_thread(str(chat_id), thread_name)
@@ -1229,6 +1236,21 @@ def _confirm_adapter_delivery(
     return True
 
 
+def _ambiguous_write_receipt(send_result) -> Optional[str]:
+    """Return a receipt for structured non-retryable ambiguous writes."""
+    if send_result is None:
+        return None
+    raw_response = _result_field(send_result, "raw_response")
+    retryable = _result_field(send_result, "retryable")
+    if retryable is True or not isinstance(raw_response, dict):
+        return None
+    delivery = str(raw_response.get("delivery") or "").strip().lower()
+    if delivery != "mutation_uncertain":
+        return None
+    receipt = raw_response.get("receipt") or raw_response.get("receipt_id")
+    return str(receipt) if receipt else "unknown"
+
+
 def _is_channel_dm_topic(runtime_adapter: Any, chat_id: Any, loop: Any, job_id: str) -> bool:
     """Is an ambiguous ``telegram:<positive_chat_id>:<numeric_thread_id>`` target a channel
     Direct-Messages topic (``direct_messages_topic_id``) rather than a private-chat forum topic
@@ -1505,8 +1527,9 @@ def _live_send_text(
     if future is None:
         target_errors.append("live adapter event loop scheduling failed")
         return False, False, None
+    send_timeout = min(300, _LIVE_SEND_CONFIRM_TIMEOUT_SECS + 30 * (len(text_to_send) // 800))
     try:
-        send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_SECS)
+        send_result = future.result(timeout=send_timeout)
     except TimeoutError:
         # Slow confirmation != failure. Never started (loop wedged): nothing was sent, so fall through
         # to standalone or it is silently dropped. Started: in flight (a paced multi-chunk send can
@@ -1521,10 +1544,10 @@ def _live_send_text(
             return False, False, None
         logger.warning(
             "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
+            "after %ss; already dispatched (in flight), "
             "assuming delivered (skipping standalone fallback "
             "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
+            job["id"], t.platform_name, t.chat_id, send_timeout)
         return True, True, None
     except PartialDeliveryError as ex:
         # The head of a split send is already on screen: a standalone resend would duplicate it.
@@ -1534,6 +1557,16 @@ def _live_send_text(
             f"{raw.get('total_chunks', '?')} chunks, then failed: {ex}", delivery_errors)
         return True, False, None
     except Exception as ex:
+        receipt = _ambiguous_write_receipt(getattr(ex, "send_result", None))
+        if receipt is not None:
+            msg = (
+                f"live adapter delivery to {t.where} reported an ambiguous write "
+                f"(mutation_uncertain, receipt={receipt}); skipping standalone "
+                "fallback to avoid a duplicate send"
+            )
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            return True, False, None
         # Real send error (not a slow confirmation): fall through to standalone. The router raises
         # a failed SendResult's error string, so this is where send_path_degraded arrives.
         t.live_error = str(ex)

@@ -1954,6 +1954,7 @@ class _PreToolCallDirective:
     message: Optional[str] = None
     rule_key: Optional[str] = None
     modified_args: Optional[dict[str, Any]] = None
+    always_prompt: bool = False
 
 
 def set_thread_tool_whitelist(
@@ -1991,6 +1992,7 @@ def _get_pre_tool_call_directive_details(
     )
     modified_args: Optional[dict[str, Any]] = None
     first_approve: Optional[tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
+    always_prompt = False
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -2013,13 +2015,14 @@ def _get_pre_tool_call_directive_details(
             continue
         if action == "block":
             return _PreToolCallDirective(action="block", message=message, modified_args=modified_args)
+        always_prompt = always_prompt or result.get("always_prompt") is True
         # approve is held back until the whole list has been scanned for a veto.
         if first_approve is None:
             rule_key = result.get("rule_key")
             first_approve = (message, (rule_key.strip() or None) if isinstance(rule_key, str) else None)
     if first_approve is not None:
         return _PreToolCallDirective(action="approve", message=first_approve[0], rule_key=first_approve[1],
-                                     modified_args=modified_args)
+                                     modified_args=modified_args, always_prompt=always_prompt)
     return _PreToolCallDirective(modified_args=modified_args)
 
 
@@ -2066,7 +2069,12 @@ def _resolve_block_from_details(
             approval_tokens = set_current_observability_context(
                 turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id)
         try:
-            result = request_tool_approval(tool_name, details.message or "", rule_key=details.rule_key or tool_name)
+            result = request_tool_approval(
+                tool_name,
+                details.message or "",
+                rule_key=details.rule_key or tool_name,
+                always_prompt=details.always_prompt,
+            )
         finally:
             if approval_tokens is not None:
                 with suppress(Exception):

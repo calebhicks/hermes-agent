@@ -49,6 +49,24 @@ class TestSessionSourceRoundtrip:
         assert restored.thread_id == "t1"
 
 
+    def test_role_authorization_is_process_local_not_serialized(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="validated-room",
+            chat_type="group",
+            role_authorized=True,
+        )
+        assert "role_authorized" not in source.to_dict()
+        assert SessionSource.from_dict(source.to_dict()).role_authorized is False
+
+
+    def test_minimal_roundtrip(self):
+        source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
+        d = source.to_dict()
+        restored = SessionSource.from_dict(d)
+        assert restored.platform == Platform.LOCAL
+        assert restored.chat_id == "cli"
+        assert restored.chat_type == "dm"  # default value preserved
 
 
 
@@ -1637,5 +1655,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

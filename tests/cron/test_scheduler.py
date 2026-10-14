@@ -1875,6 +1875,152 @@ class TestDeliverResultPartialSplitDelivery:
         standalone_send.assert_not_awaited()
         assert result and "delivered 2 of 5 chunks" in result, result
 
+    def test_started_delivery_is_never_cancelled_or_resent(self):
+        """A coroutine suspended after entering may still report cancel=True.
+        Once the delivery started, cancelling can truncate the provider send and
+        standalone fallback can duplicate the whole payload.
+        """
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        captured_future = Future()
+        cancel_calls = []
+
+        def suspended_cancel():
+            cancel_calls.append(True)
+            return True
+
+        captured_future.cancel = suspended_cancel
+        captured_future.result = MagicMock(side_effect=TimeoutError("timed out"))
+
+        def fake_run_coro(coro, _loop):
+            try:
+                coro.send(None)
+            except StopIteration:
+                pass
+            coro.close()
+            return captured_future
+
+        job = {
+            "id": "midflight-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        standalone_send = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert cancel_calls == [], "a started delivery must never be cancelled"
+        assert result is None, f"expected assume-delivered, got error: {result!r}"
+        standalone_send.assert_not_awaited()
+
+
+class TestAmbiguousWriteNeverFallsBackToStandalone:
+    def _run(self, side_effect):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        captured_future = Future()
+        captured_future.cancel = MagicMock(return_value=False)
+        captured_future.result = MagicMock(side_effect=side_effect)
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return captured_future
+
+        job = {
+            "id": "ambiguous-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+        standalone_send = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+        return result, standalone_send
+
+    def test_mutation_uncertain_suppresses_the_standalone_fallback(self):
+        from gateway.delivery import DeliveryResultError
+
+        uncertain = MagicMock()
+        uncertain.success = False
+        uncertain.retryable = False
+        uncertain.raw_response = {
+            "delivery": "mutation_uncertain",
+            "receipt": "imessage-0123456789abcdef",
+        }
+        error = DeliveryResultError(
+            "iMessage fallback outcome is uncertain; do not retry",
+            send_result=uncertain,
+        )
+        result, standalone_send = self._run(error)
+        standalone_send.assert_not_awaited()
+        assert result is not None and "mutation_uncertain" in result
+
+    def test_ordinary_send_failure_still_falls_back_to_standalone(self):
+        result, standalone_send = self._run(RuntimeError("telegram send failed"))
+        standalone_send.assert_awaited()
+        assert result is None
+
+    def test_retryable_structured_failure_still_falls_back(self):
+        from gateway.delivery import DeliveryResultError
+
+        transient = MagicMock()
+        transient.success = False
+        transient.retryable = True
+        transient.raw_response = {"delivery": "mutation_uncertain"}
+        error = DeliveryResultError("transient", send_result=transient)
+        result, standalone_send = self._run(error)
+        standalone_send.assert_awaited()
+        assert result is None
+
+    def test_router_raise_site_carries_the_structured_result(self):
+        from gateway.delivery import DeliveryResultError, _send_result_error
+
+        failed = MagicMock()
+        failed.success = False
+        failed.error = ""
+        error = DeliveryResultError("boom", send_result=failed)
+        assert _send_result_error(failed) == ""
+        assert error.send_result is failed
+        assert isinstance(error, RuntimeError)
+
 
 class TestDeliverResultLiveAdapterUnconfirmed:
     """Regression for #47056.
@@ -2135,6 +2281,59 @@ class TestCronDeliveryMirror:
     # --- multi-participant parity with send_message (user_id passthrough) ---
 
     # --- continuable cron: thread-preferred (Teknium's interface) ---
+
+    def test_open_thread_returns_id_on_thread_platform(self):
+        """On a thread-capable adapter, _open_continuable_cron_thread returns
+        the new thread id from create_handoff_thread."""
+        from cron.scheduler_delivery import _open_continuable_cron_thread
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value="9001")
+
+        # safe_schedule_threadsafe hands the coro to the gateway loop and
+        # returns a future. Patch it to close the coro and return a ready
+        # future carrying the adapter's thread id.
+        def _run_now(coro, _loop):
+            coro.close()
+            fut = MagicMock()
+            fut.result.return_value = "9001"
+            return fut
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_run_now):
+            tid = _open_continuable_cron_thread(
+                {"id": "j1", "name": "Brief"}, adapter, "123", loop=MagicMock(),
+            )
+        assert tid == "9001"
+        adapter.create_handoff_thread.assert_called_once_with("123", "Hermes — Brief")
+
+    def test_open_thread_uses_audience_facing_title_when_provided(self):
+        """A job may keep its internal cron name out of the visible thread seed."""
+        from cron.scheduler_delivery import _open_continuable_cron_thread
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value="9002")
+
+        def _run_now(coro, _loop):
+            coro.close()
+            fut = MagicMock()
+            fut.result.return_value = "9002"
+            return fut
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_run_now):
+            tid = _open_continuable_cron_thread(
+                {
+                    "id": "j2",
+                    "name": "draper-brief-caleb-20260814",
+                    "origin": {"thread_title": "Daily GTM Brief — Aug 14"},
+                },
+                adapter,
+                "123",
+                loop=MagicMock(),
+            )
+        assert tid == "9002"
+        adapter.create_handoff_thread.assert_called_once_with(
+            "123", "Daily GTM Brief — Aug 14"
+        )
 
     def test_seed_thread_session_creates_session_and_mirrors(self):
         """Seeding a freshly-opened thread creates the thread-keyed session via

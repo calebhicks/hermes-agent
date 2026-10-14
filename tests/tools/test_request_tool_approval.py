@@ -6,6 +6,8 @@ Tier-2 dangerous-command match: session/permanent allowlist, the CLI prompt,
 the gateway submit_pending path, cron_mode, and fail-closed timeouts.
 """
 
+from unittest.mock import Mock
+
 import pytest
 
 from tools import approval
@@ -211,10 +213,55 @@ class TestRequestToolApproval:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
 
-        res = request_tool_approval("home_lock", "unlock the front door", rule_key="unlock")
+        from gateway.session_context import set_session_vars, clear_session_vars
+        tokens = set_session_vars(platform="api_server")
+        try:
+            res = request_tool_approval("home_lock", "unlock the front door", rule_key="unlock")
+        finally:
+            clear_session_vars(tokens)
 
         assert res["approved"] is False
         assert "unattended platform" in res["message"].lower()
+    def test_always_prompt_ignores_yolo_and_cached_approval(self, monkeypatch):
+        monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: True)
+        monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        prompt = Mock(return_value="once")
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", prompt)
+        result = request_tool_approval(
+            "nb_canada_execute", "one live read", always_prompt=True
+        )
+        assert result["approved"] is True
+        prompt.assert_called_once()
+
+    def test_always_prompt_blocks_unattended_even_if_cron_autoapproves(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: True)
+        monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "approve")
+        result = request_tool_approval(
+            "nb_canada_execute", "one live read", always_prompt=True
+        )
+        assert result["approved"] is False
+
+    def test_always_prompt_gateway_denial_never_persists(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda data: None)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda *args, **kwargs: {"resolved": True, "choice": "deny"},
+        )
+        persist = Mock()
+        monkeypatch.setattr(approval, "approve_session", persist)
+        monkeypatch.setattr(approval, "approve_permanent", persist)
+        result = request_tool_approval(
+            "nb_canada_execute", "one live read", always_prompt=True
+        )
+        assert result["approved"] is False
+        assert result["user_consent"] is False
+        persist.assert_not_called()
 
     def test_yolo_session_bypasses_gate(self, monkeypatch):
         """A --yolo session skips the plugin approval gate (parity with the
@@ -247,3 +294,36 @@ class TestRequestToolApproval:
         )
         res = request_tool_approval("computer_use", "click", rule_key="cua")
         assert res == {"approved": True, "message": None}
+
+class TestExactOperationApproval:
+    def test_native_queue_requires_exact_prompt_even_in_yolo(self, monkeypatch):
+        monkeypatch.setattr(approval, '_is_gateway_approval_context', lambda: True)
+        monkeypatch.setattr(approval, '_presence', lambda cb: (None, False, True, False))
+        monkeypatch.setattr(approval, '_yolo_active', lambda: True)
+        monkeypatch.setattr(approval, '_gateway_queues', {})
+        monkeypatch.setattr(approval, '_gateway_prompt_index', {})
+        seen = []
+        def notify(data):
+            seen.append(data)
+            assert data['command'] == 'exact before -> after'
+            assert data['require_prompt_binding'] is True
+            assert data['allow_session'] is False and data['allow_permanent'] is False
+            assert approval.resolve_gateway_approval('test-session', 'once') == 0
+            assert approval.bind_gateway_approval_prompt(session_key='test-session',
+                request_id=data['request_id'], platform='slack', chat_id='dm', prompt_message_id='card')
+            assert approval.resolve_gateway_approval_by_prompt(platform='slack', chat_id='dm',
+                prompt_message_id='card', choice='once') == 1
+        monkeypatch.setattr(approval, '_gateway_notify_cb', lambda key: notify)
+        result = request_tool_approval('fixture', 'Confirm exact change',
+                    display_target='exact before -> after', require_prompt_binding=True)
+        assert result['approved'] is True and len(seen) == 1
+
+    def test_exact_operation_denies_non_gateway(self, monkeypatch):
+        monkeypatch.setattr(approval, '_is_gateway_approval_context', lambda: False)
+        assert request_tool_approval('fixture', 'x', display_target='values', require_prompt_binding=True)['approved'] is False
+
+    def test_exact_operation_never_hides_redacted_fields(self, monkeypatch):
+        monkeypatch.setattr(approval, '_is_gateway_approval_context', lambda: True)
+        monkeypatch.setattr(approval, '_gateway_notify_cb', lambda key: lambda data: None)
+        monkeypatch.setattr('agent.redact.redact_sensitive_text', lambda x, **kw: '[redacted]')
+        assert request_tool_approval('fixture', 'x', display_target='values', require_prompt_binding=True)['approved'] is False

@@ -171,6 +171,30 @@ class TestBuildJobPromptContextFrom:
         assert "HEAD" in prompt  # head+tail clip keeps both ends
         assert "TAIL" in prompt
 
+    def test_long_run_context_keeps_response_instead_of_repeated_prompt(self, cron_env):
+        """A stored run's response survives when its assembled prompt exceeds the context cap."""
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job_a = create_job(prompt="Collect evidence", schedule="every 1h")
+        out_dir = OUTPUT_DIR / job_a["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "2026-04-22_10-00-00.md").write_text(
+            "# Cron Job: Collector\n**Run:** 2026-04-22 10:00 UTC\n\n"
+            "## Prompt\n\n" + ("repeated prompt " * 1000)
+            + "\n\n## Response\n\nDECISION_READY_EVIDENCE",
+            encoding="utf-8",
+        )
+
+        job_b = create_job(
+            prompt="Review evidence", schedule="every 2h", context_from=job_a["id"]
+        )
+        prompt = _build_job_prompt(job_b)
+
+        assert "DECISION_READY_EVIDENCE" in prompt
+        assert "repeated prompt repeated prompt" not in prompt
+        assert "## Prompt" not in prompt
+
 
     def test_invalid_job_id_skipped(self, cron_env):
         """context_from with path traversal job_id should be skipped."""
@@ -394,5 +418,4 @@ class TestContinuityFlag:
         prompt = _build_job_prompt(job)
         assert "Reported: story A" in prompt
         assert "previous run" in prompt.lower()
-
 

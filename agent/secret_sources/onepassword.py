@@ -293,6 +293,7 @@ class OnePasswordSource(SecretSource):
                                           "default": _DEFAULT_TOKEN_ENV},
             "binary_path": {"description": "Pin the op binary (empty = resolve via PATH)", "default": ""},
             "cache_ttl_seconds": {"description": "Disk+memory cache TTL; 0 disables", "default": 300},
+            "lazy_sources": {"description": "Session sources resolving mapped credentials on first use", "default": []},
             "override_existing": {"description": "Resolved values overwrite .env/shell values", "default": True},
         }
 

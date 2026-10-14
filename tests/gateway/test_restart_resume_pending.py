@@ -276,6 +276,10 @@ class TestResumePendingSystemNote:
         assert "skip any unfinished work" not in note
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
+        assert "durable conversation history as the work checkpoint" in note
+        assert "steps whose results are proven" in note
+        assert "external effects that remain uncertain" in note
+        assert "inspect current state" in note
 
 
 
@@ -599,7 +603,7 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
     adapter.handle_message = AsyncMock()
 
-    scheduled = runner._schedule_resume_pending_sessions()
+    scheduled = await runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
     assert scheduled == 0
@@ -649,7 +653,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
     adapter.handle_message = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: adapter}
 
-    scheduled = runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM)
+    scheduled = await runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM)
     await asyncio.sleep(0)
 
     # Only the telegram session is resumed; the discord session waits for its
@@ -702,7 +706,7 @@ async def test_startup_auto_resume_freshness_survives_spring_forward(monkeypatch
         runner.session_store._entries = {entry.session_key: entry}
         adapter.handle_message = AsyncMock()
 
-        scheduled = runner._schedule_resume_pending_sessions()
+        scheduled = await runner._schedule_resume_pending_sessions()
     finally:
         if original_tz is None:
             os.environ.pop("TZ", None)
@@ -742,7 +746,7 @@ async def test_served_profile_reconnect_resumes_what_boot_deferred():
     )
     runner.session_store._entries = {entry.session_key: entry}
     primary.handle_message = AsyncMock()
-    assert runner._schedule_resume_pending_sessions() == 0  # boot: coder's bot is down
+    assert await runner._schedule_resume_pending_sessions() == 0
 
     coder = RestartTestAdapter()
     coder.handle_message = AsyncMock()
@@ -794,7 +798,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
     adapter.handle_message = fake_handle_message
 
-    scheduled = runner._schedule_resume_pending_sessions()
+    scheduled = await runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
     inbound = MessageEvent(
@@ -984,6 +988,7 @@ async def test_warmup_disabled_by_nonpositive_timeout(monkeypatch):
 async def test_restart_notifies_home_channel_even_without_active_sessions():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,
         chat_id="home-42",
@@ -993,13 +998,14 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 1
-    assert "restarting" in adapter.sent[0] and "Send any message" in adapter.sent[0]
+    assert "restarting" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
 async def test_restart_home_channel_notification_not_deduped_across_threads():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = True
     session_key = "agent:main:telegram:group:999"
     runner.session_store._entries[session_key] = MagicMock(
         origin=SessionSource(
@@ -1104,7 +1110,7 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
 
     adapter.handle_message = _slow_handle
 
-    scheduled = runner._schedule_resume_pending_sessions()
+    scheduled = await runner._schedule_resume_pending_sessions()
 
     assert scheduled == 1
     # The sentinel must be set immediately — before the task starts executing.
@@ -1203,7 +1209,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     )
     adapter._run_processing_hook = AsyncMock()
 
-    scheduled = runner._schedule_resume_pending_sessions()
+    scheduled = await runner._schedule_resume_pending_sessions()
     assert scheduled == 1
     # Pre-claim must be visible immediately.
     assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
@@ -1283,6 +1289,64 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
+
+
+@pytest.mark.asyncio
+async def test_adapter_persisted_source_allow_is_authoritative():
+    runner, adapter = make_restart_runner()
+    runner._is_user_authorized = lambda _source: False
+    adapter.authorize_persisted_source = AsyncMock(return_value=True)
+    source = make_restart_source(chat_id="structured-room")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:structured-room",
+        session_id="sid", created_at=datetime.now(), updated_at=datetime.now(),
+        origin=source, platform=Platform.TELEGRAM, chat_type="group",
+        resume_pending=True, resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+    assert await runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_adapter_persisted_source_deny_cannot_be_overridden():
+    runner, adapter = make_restart_runner()
+    runner._is_user_authorized = lambda _source: True
+    adapter.authorize_persisted_source = AsyncMock(return_value=False)
+    source = make_restart_source(chat_id="removed-room")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:removed-room",
+        session_id="sid", created_at=datetime.now(), updated_at=datetime.now(),
+        origin=source, platform=Platform.TELEGRAM, chat_type="group",
+        resume_pending=True, resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+    assert await runner._schedule_resume_pending_sessions() == 0
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_adapter_persisted_source_exception_denies_resume():
+    runner, adapter = make_restart_runner()
+    runner._is_user_authorized = lambda _source: True
+    adapter.authorize_persisted_source = AsyncMock(side_effect=RuntimeError("private"))
+    source = make_restart_source(chat_id="hook-error-room")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:hook-error-room",
+        session_id="sid", created_at=datetime.now(), updated_at=datetime.now(),
+        origin=source, platform=Platform.TELEGRAM, chat_type="group",
+        resume_pending=True, resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+    assert await runner._schedule_resume_pending_sessions() == 0
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1371,4 +1435,3 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-

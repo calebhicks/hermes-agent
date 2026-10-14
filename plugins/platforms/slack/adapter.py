@@ -4977,6 +4977,18 @@ class SlackAdapter(BasePlatformAdapter):
             actions = [
                 self._button(label, self._EA_ACTION_IDS[choice], prompt.session_key, style=style)
                 for label, choice, style in prompt.actions]
+            if (prompt.metadata or {}).get("exact_operation") is True:
+                if len(prompt.command) > 12000:
+                    raise ValueError("Exact operation exceeds the complete approval display bound")
+                # Slack plain_text preserves Unicode and literal markup. Split
+                # at the provider's section limit without dropping any content.
+                blocks = [{"type": "section", "text": {"type": "plain_text",
+                           "text": "Review this change\n" + prompt.description, "emoji": False}}]
+                blocks += [{"type": "section", "text": {"type": "plain_text",
+                            "text": prompt.command[offset:offset + 1400], "emoji": False}}
+                           for offset in range(0, len(prompt.command), 1400)]
+                blocks.append({"type": "actions", "elements": actions})
+                return "Review this change in the complete confirmation card.", blocks
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": prompt.text}},
                 {"type": "actions", "elements": actions}]
@@ -5632,8 +5644,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve FIRST (unblocks the agent); render after so a click past the
         # timeout (count == 0) shows "expired", not "approved".
         try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            from tools.approval import resolve_gateway_approval_by_prompt
+            # A timed-out card must never approve the next request in this
+            # session. Only a provider-confirmed prompt binding is authority.
+            count = resolve_gateway_approval_by_prompt(
+                platform="slack", chat_id=channel_id,
+                prompt_message_id=msg_ts, choice=choice,
+            )
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)", count,
                 session_key, choice, user_name)

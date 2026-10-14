@@ -1202,6 +1202,9 @@ class GatewaySlashCommandsMixin(
         choice = "always" if "always" in choices else "session" if "session" in choices else "once"
         count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args)
         if not count:
+            from tools.approval import list_gateway_approvals
+            if any(item.get("require_prompt_binding") for item in list_gateway_approvals(session_key)):
+                return "Use Allow Once on the exact confirmation card, or reply directly to it. This command did not approve the change."
             return t("gateway.approve.no_pending")
         confirmation_text = t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)

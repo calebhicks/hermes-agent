@@ -472,7 +472,13 @@ def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False
     (*resolved_identity*, computed by the caller outside the registry lock; None refuses) must hash
     to what the owner connected with. Within one profile the connection is the profile's: its
     default cwd resolves in the connection task's own context, never per session."""
-    if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
+    try:
+        if isinstance(config, _config.DeferredMCPConfig):
+            config = _config._interpolate_env_vars(config)
+        if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
+            return False
+    except Exception as exc:
+        logger.warning("MCP connection identity unavailable (%s)", type(exc).__name__)
         return False
     if not cross_profile:
         return True
@@ -529,7 +535,7 @@ def _register_connected_into_current_scope(servers: dict) -> int:
                         if name in foreign and config is not None and mcp_server_enabled(config)}
 
     with _core._lock:
-        stale = []
+        current = []
         for key, scopes in _core._server_tool_scopes.items():
             if scope not in scopes:
                 continue
@@ -539,11 +545,12 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             server = _core._servers.get(key)
             config = judged[name]
             cross_profile = _key_scope(key) != scope
-            if (config is None or not mcp_server_enabled(config) or server is None
-                    or getattr(server, "session", None) is None
-                    or not _same_server_route(server, config, cross_profile=cross_profile,
-                                              resolved_identity=resolved_ids.get(name))):
-                stale.append(key)
+            current.append((key, server, config, cross_profile))
+    stale = [key for key, server, config, cross_profile in current
+             if (config is None or not mcp_server_enabled(config) or server is None
+                 or getattr(server, "session", None) is None
+                 or not _same_server_route(server, config, cross_profile=cross_profile,
+                                           resolved_identity=resolved_ids.get(_key_name(key))))]
     for key in stale:
         _remove_server_scope(key, scope)
 
@@ -555,15 +562,18 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             if _server_key(name, scope, current=False) in _core._servers:
                 continue  # this profile has its own connection for the name
             # Any other profile's live connection with the same route AND credentials is shareable.
-            shared = [(key, live) for key, live in _core._servers.items()
-                      if _key_name(key) == name and getattr(live, "session", None) is not None
-                      and _same_server_route(live, config, cross_profile=True,
-                                             resolved_identity=resolved_ids.get(name))]
+            candidates = [(key, live) for key, live in _core._servers.items()
+                          if _key_name(key) == name and getattr(live, "session", None) is not None]
+        shared = [(key, live) for key, live in candidates
+                  if _same_server_route(live, config, cross_profile=True,
+                                        resolved_identity=resolved_ids.get(name))]
         if not shared:
             continue
         key, server = shared[0]
         # Visibility for this profile: the owner keeps teardown, this scope sees the connection.
         with _core._lock:
+            if _core._servers.get(key) is not server or getattr(server, "session", None) is None:
+                continue
             _core._server_tool_scopes.setdefault(key, set()).add(scope)
         _record_scope_trust(name, config, scope)
         if registry.get_tool_names_for_toolset(f"mcp-{name}"):
@@ -601,7 +611,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> list[str]
     if registered:
         with _core._lock:
             key = _server_key(name)
-            _core._lazy_server_configs[key] = dict(config)
+            _core._lazy_server_configs[key] = config.copy()
             _core._lazy_server_fingerprints[key] = config_fingerprint(config)
             _core._lazy_server_tool_names[key] = list(registered)
         logger.info("MCP server '%s' (lazy): registered %d tool(s) from schema cache", name, len(registered))

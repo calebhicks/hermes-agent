@@ -303,6 +303,32 @@ def test_wecom_open_group_with_per_group_sender_allowlist_is_authorized(monkeypa
     assert runner._is_user_authorized(_source(Platform.WECOM, chat_type="group")) is True
 
 
+def test_adapter_group_sender_gate_precedes_direct_environment_allowlist(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WECOM_ALLOWED_USERS", "direct-owner")
+    config = GatewayConfig(platforms={Platform.WECOM: PlatformConfig(enabled=True)})
+    runner, adapter = _make_runner(Platform.WECOM, config, enforces=True)
+    adapter._group_policy = "allowlist"
+    adapter._groups = {
+        "some-chat": {"allow_from": ["some-user", "direct-owner"]}
+    }
+    adapter.is_group_sender_allowed = lambda chat_id, user_id: (
+        chat_id == "some-chat" and user_id == "some-user"
+    )
+
+    allowed = _source(Platform.WECOM, chat_type="group")
+    assert runner._is_user_authorized(allowed) is True
+
+    denied = SessionSource(
+        platform=Platform.WECOM,
+        user_id="other-user",
+        chat_id="some-chat",
+        user_name="other",
+        chat_type="group",
+    )
+    assert runner._is_user_authorized(denied) is False
+
+
 # ---------------------------------------------------------------------------
 # Layer 2b: `dm_policy: pairing` is NOT blanket-trusted
 # ---------------------------------------------------------------------------

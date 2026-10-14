@@ -540,6 +540,17 @@ def _portable_mcp_servers(safe_servers: dict[str, dict]) -> None:
         logger.debug("Failed to load portable MCP servers", exc_info=True)
 
 
+class DeferredMCPConfig(dict):
+    """Unresolved native lazy-server config; preserved through cache registration.
+
+    This type is internal only. Plain caller-supplied dictionaries are already
+    materialized and must never be interpolated a second time.
+    """
+
+    def copy(self):
+        return type(self)(self)
+
+
 def _load_mcp_config() -> dict[str, dict]:
     """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated."""
     try:
@@ -554,8 +565,11 @@ def _load_mcp_config() -> dict[str, dict]:
         except Exception:
             pass
         safe_servers: dict[str, dict] = {}
+        from tools.mcp_tool_common import _parse_boolish
         for name, cfg in _filter_suspicious_mcp_servers(servers if isinstance(servers, dict) else {}).items():
-            interpolated = _interpolate_env_vars(cfg)
+            # Lazy discovery needs schemas, not credentials. Preserve references
+            # for connection-time interpolation and stable schema-cache identity.
+            interpolated = DeferredMCPConfig(cfg) if isinstance(cfg, dict) and _parse_boolish(cfg.get("lazy", False)) else _interpolate_env_vars(cfg)
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated

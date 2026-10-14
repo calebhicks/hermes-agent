@@ -106,6 +106,14 @@ def _send_result_error(result: Any) -> Optional[str]:
     return None if get("success", True) is not False else str(get("error") or "")
 
 
+class DeliveryResultError(RuntimeError):
+    """A platform send failed with a structured result worth preserving."""
+
+    def __init__(self, message: str, send_result: Any = None):
+        super().__init__(message)
+        self.send_result = send_result
+
+
 @dataclass
 class DeliveryTarget:
     """One target: "origin", "local", "telegram" (home channel) or "telegram:123456[:thread]"."""
@@ -330,5 +338,5 @@ class DeliveryRouter:
             from gateway.platforms.base import BasePlatformAdapter
             if BasePlatformAdapter._is_partial_delivery(result):
                 raise PartialDeliveryError(error, result)
-            raise RuntimeError(error or f"{target.platform.value} delivery failed")
+            raise DeliveryResultError(error or f"{target.platform.value} delivery failed", send_result=result)
         return result

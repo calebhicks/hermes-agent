@@ -717,11 +717,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
             if queue_during_drain:
                 self._queue_or_replace_pending_event(_quick_key, event)
-            return (
-                t("gateway.busy.drain_queued", action=self._status_action_gerund())
-                if queue_during_drain
-                else t("gateway.busy.drain_rejected", action=self._status_action_gerund())
-            )
+                return None
+            return t("gateway.busy.drain_rejected", action=self._status_action_gerund())
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
             self._queue_or_replace_pending_event(_quick_key, event)
@@ -1223,6 +1220,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         Only events that may control the gateway (``allow_gateway_control``) can answer them."""
         if not event.allow_gateway_control:
             return None
+        _handled_exact_approval, _exact_approval_reply = await self._handle_exact_approval_reply(
+            event, _quick_key, send_ack=False,
+        )
+        if _handled_exact_approval:
+            return _exact_approval_reply
         _reply = self._hm_update_prompt_reply(event, _quick_key)
         if _reply is None:
             _reply = await self._hm_clarify_reply(event, source, _quick_key)

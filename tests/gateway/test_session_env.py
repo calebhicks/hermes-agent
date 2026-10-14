@@ -76,6 +76,24 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
+def test_set_session_env_propagates_explicit_turn_provenance():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="2",
+        chat_type="dm",
+        user_id="owner",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    context.turn_source = "gateway_inbound"
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_SOURCE") == "gateway_inbound"
+    finally:
+        runner._clear_session_env(tokens)
+
+
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
     runner = object.__new__(GatewayRunner)
@@ -315,4 +333,3 @@ async def test_plugin_slash_command_sees_session_env(monkeypatch):
     assert seen["chat_id"] == "c1"
     # Bound only for the handler call, not leaked past dispatch
     assert get_session_env("HERMES_SESSION_KEY") == ""
-

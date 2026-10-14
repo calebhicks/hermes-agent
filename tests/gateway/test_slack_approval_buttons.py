@@ -172,7 +172,7 @@ class TestSlackApprovalAction:
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+        with patch("tools.approval.resolve_gateway_approval_by_prompt", return_value=1):
             await adapter._handle_approval_action(ack, body, action)
 
         update_kwargs = mock_client.chat_update.call_args[1]
@@ -199,7 +199,7 @@ class TestSlackApprovalAction:
             "value": "agent:main:slack:group:C1:1111",
         }
 
-        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+        with patch("tools.approval.resolve_gateway_approval_by_prompt") as mock_resolve:
             await adapter._handle_approval_action(ack, body, action)
 
         ack.assert_called_once()
@@ -839,3 +839,80 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
+
+
+class TestExactSlackRequest:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action_id", ["hermes_approve_once", "hermes_deny"])
+    async def test_old_card_cannot_approve_new_request(self, monkeypatch, action_id):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["old-card"] = False
+        entry = _ApprovalEntry({"request_id": "new-request"})
+        monkeypatch.setattr(approval, "_gateway_queues", {"session-key": [entry]})
+        monkeypatch.setattr(approval, "_gateway_prompt_index", {})
+        body = {"message": {"ts": "old-card", "blocks": []},
+                "channel": {"id": "C1"}, "user": {"name": "alice", "id": "U_ALICE"}}
+        await adapter._handle_approval_action(AsyncMock(), body,
+            {"action_id": action_id, "value": "session-key"})
+        assert not entry.event.is_set()
+        assert approval._gateway_queues["session-key"] == [entry]
+
+    @pytest.mark.asyncio
+    async def test_second_card_resolves_second_request_only(self, monkeypatch):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["second-card"] = False
+        first = _ApprovalEntry({"request_id": "first"})
+        second = _ApprovalEntry({"request_id": "second"})
+        monkeypatch.setattr(approval, "_gateway_queues", {"session-key": [first, second]})
+        monkeypatch.setattr(approval, "_gateway_prompt_index", {})
+        assert approval.bind_gateway_approval_prompt(session_key="session-key", request_id="second",
+            platform="slack", chat_id="C1", prompt_message_id="second-card")
+        body = {"message": {"ts": "second-card", "blocks": []},
+                "channel": {"id": "C1"}, "user": {"name": "alice", "id": "U_ALICE"}}
+        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+        await adapter._handle_approval_action(AsyncMock(), body, action)
+        assert not first.event.is_set()
+        assert second.event.is_set() and second.result == "once"
+        await adapter._handle_approval_action(AsyncMock(), body, action)
+        assert not first.event.is_set()
+
+    def test_exact_requests_cannot_be_approved_by_unbound_slash(self, monkeypatch):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        exact = _ApprovalEntry({"request_id": "exact", "require_prompt_binding": True})
+        normal = _ApprovalEntry({"request_id": "normal"})
+        monkeypatch.setattr(approval, "_gateway_queues", {"key": [exact, normal]})
+        monkeypatch.setattr(approval, "_gateway_prompt_index", {})
+        assert approval.resolve_gateway_approval("key", "once") == 0
+        assert approval.resolve_gateway_approval("key", "always", resolve_all=True) == 1
+        assert not exact.event.is_set() and normal.event.is_set()
+        assert approval.bind_gateway_approval_prompt(session_key="key", request_id="exact",
+            platform="slack", chat_id="dm", prompt_message_id="card")
+        assert approval.resolve_gateway_approval_by_prompt(platform="slack", chat_id="wrong-dm",
+            prompt_message_id="card", choice="once") == 0
+        assert approval.resolve_gateway_approval_by_prompt(platform="slack", chat_id="dm",
+            prompt_message_id="card", choice="once") == 1
+        assert exact.event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_exact_operation_preview_is_complete_plain_text():
+    adapter = _make_adapter()
+    client = adapter._team_clients["T1"]
+    client.chat_postMessage = AsyncMock(return_value={"ts": "preview-card"})
+    operation = '学校 — é ``` <@everyone> & \u0060 ' * 180
+    result = await adapter.send_exec_approval(chat_id="C1", command=operation,
+        session_key="key", description="Confirm your own work, no personnel information.",
+        metadata={"exact_operation": True}, allow_permanent=False, allow_session=False)
+    assert result.success
+    blocks = client.chat_postMessage.call_args.kwargs["blocks"]
+    assert all(b["text"]["type"] == "plain_text" for b in blocks[:-1])
+    assert ''.join(b["text"]["text"] for b in blocks[1:-1]) == operation
+    assert all(len(b["text"]["text"].encode("utf-16-le")) // 2 <= 3000 for b in blocks[:-1])
+    assert [b['action_id'] for b in blocks[-1]['elements']] == ['hermes_approve_once', 'hermes_deny']

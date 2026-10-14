@@ -573,38 +573,45 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
     asyncio.run(_scenario())
 
 
-def test_breaker_opened_by_tool_errors_says_rejected_not_unreachable(monkeypatch, tmp_path):
-    """Three completed calls whose payload is an error still open the breaker (#10447), but the
-    open-breaker message must not claim the server is unreachable — it answered every time
-    (#11113); a single transport strike in the streak makes it "unreachable" again."""
+def test_application_errors_keep_transport_available(monkeypatch, tmp_path):
+    from types import SimpleNamespace
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
     from tools import mcp_tool
-    from tools.mcp_tool_handlers import _make_tool_handler
-
-    async def _call_tool_rejects(*a, **kw):
-        result = MagicMock()
-        result.is_error = True
-        block = MagicMock()
-        block.text = "DNS lookup failed for https://nope.invalid"
-        result.content = [block]
-        result.structured_content = None
-        return result
-
-    _install_stub_server(mcp_tool, "srv", _call_tool_rejects)
+    from tools.mcp_tool_handlers import _make_tool_handler, _retry_once
+    calls = []
+    async def respond(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(isError=True, content=[SimpleNamespace(text='{"error":"page_not_found"}')])
+    _install_stub_server(mcp_tool, "application-errors", respond)
     _mcp_loop._ensure_mcp_loop()
     try:
-        handler = _make_tool_handler("srv", "fetch", 10.0)
-        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD):
-            assert "DNS lookup failed" in json.loads(handler({}))["error"]
-        tripped = json.loads(handler({}))["error"].lower()
-        assert "rejected" in tripped and "unreachable" not in tripped, tripped
-
-        mcp_tool._reset_server_error("srv")
-        mcp_tool._bump_server_error("srv")                      # transport strike
-        mcp_tool._bump_server_error("srv", application=True)
-        mcp_tool._bump_server_error("srv", application=True)
-        assert "unreachable" in json.loads(handler({}))["error"].lower()
+        handler = _make_tool_handler("application-errors", "get_page", 10)
+        for _ in range(5):
+            result = handler({})
+            assert "page_not_found" in result
+            assert "unreachable" not in result
+        assert len(calls) == 5
+        assert mcp_tool._server_error_counts.get("application-errors", 0) == 0
+        assert "page_not_found" in _retry_once("application-errors", lambda: result, "get_page", "recovery")
     finally:
         _cleanup(mcp_tool, "srv")
         mcp_tool._server_errors_all_application.pop("srv", None)
+
+
+def test_application_auth_failure_after_refresh_remains_terminal(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from tools import mcp_tool_handlers as handlers
+    from tools import mcp_oauth_manager
+    async def recovered(*args):
+        return True
+    monkeypatch.setattr(handlers, "_is_auth_error", lambda exc: True)
+    monkeypatch.setattr(mcp_oauth_manager, "get_manager", lambda: SimpleNamespace(handle_401=recovered))
+    monkeypatch.setattr(handlers._loop, "_run_on_mcp_loop", lambda fn, **kw: asyncio.run(fn()))
+    monkeypatch.setattr(handlers, "_lookup_reconnectable_server", lambda name: None)
+    monkeypatch.setattr(handlers, "_strike", lambda name, message, **kw: json.dumps({"error": message, **kw}))
+    for error in ("401 Unauthorized", "403 Forbidden", "authentication required", "token expired", "expired token", "invalid credentials"):
+        result = handlers._handle_auth_error_and_retry("fixture", RuntimeError(), lambda: json.dumps({"error": error}), "test")
+        assert json.loads(result)["needs_reauth"] is True
+    result = handlers._handle_auth_error_and_retry("fixture", RuntimeError(), lambda: '{"error":"page_not_found"}', "test")
+    assert json.loads(result) == {"error": "page_not_found"}

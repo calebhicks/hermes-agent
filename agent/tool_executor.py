@@ -38,6 +38,7 @@ from agent.inline_tool_executors import (
     InlineToolContext,
     apply_transform_tool_result,
     emit_terminal_post_tool_call,
+    inline_tool_scope_error,
     tool_hook_ids,
 )
 from agent.tool_dispatch_helpers import (
@@ -1663,6 +1664,9 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )
+    scope_error = inline_tool_scope_error(agent, function_name)
+    if scope_error is not None:
+        return _SequentialDispatch(execute=lambda next_args: scope_error)
     if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
@@ -1680,6 +1684,9 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
             error_log="context_engine.handle_tool_call raised for %s: %s",
         )
     if agent._memory_manager and agent._memory_manager.has_tool(function_name):
+        from agent.memory_manager import memory_provider_tool_allowed
+        if not memory_provider_tool_allowed(agent, function_name):
+            return _SequentialDispatch(execute=lambda next_args: json.dumps({"error": "Memory tool is outside this session's tool scope"}))
         # Memory-provider tools (hindsight_retain, honcho_search, ...) are not in the registry.
         return _SequentialDispatch(
             execute=lambda next_args: agent._memory_manager.handle_tool_call(function_name, next_args),

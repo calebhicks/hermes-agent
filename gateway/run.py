@@ -760,23 +760,23 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
-def _approval_send_outcome(future, timeout: float) -> str:
+def _approval_send_result(future, timeout: float) -> tuple[str, Any]:
     """Classify an approval prompt send as ``sent`` / ``failed`` / ``ambiguous``.
 
     ``ambiguous`` = future timed out but the card may have posted: keep the registration, do NOT re-send.
     Only a DEFINITIVE failure (error result / non-timeout exception / no future) re-asks; logged here."""
     if future is None:
         logger.warning("Prompt send failed: no scheduling future (loop unavailable)")
-        return "failed"
+        return "failed", None
     try:
         result = future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
-        return "ambiguous"
+        return "ambiguous", None
     except Exception as exc:
         logger.warning("Prompt send failed: %s", exc)
-        return "failed"
+        return "failed", None
     if getattr(result, "success", False):
-        return "sent"
+        return "sent", result
     # P5(b): a connector DECLINE is not a lane failure. The connector
     # authorized the destination and refused it; re-sending the same content as
     # plain text into that same chat is the exfiltration the egress guard
@@ -802,7 +802,7 @@ def _approval_send_outcome(future, timeout: float) -> str:
         # outcome, not an authorization one, and this lane has three verdicts
         # rather than the boolean the shared helper answers.
         logger.warning("Prompt send AMBIGUOUS (lost ack): %s", _raw.get("error"))
-        return "ambiguous"
+        return "ambiguous", result
     if declined_send(result):
         # Both shapes, one classifier: a structured body, or the uniform
         # decline sentence from an older connector.
@@ -810,9 +810,15 @@ def _approval_send_outcome(future, timeout: float) -> str:
             "Prompt send DECLINED by connector egress guard: %s",
             getattr(result, "error", None),
         )
-        return "declined"
+        return "declined", result
     logger.warning("Prompt send failed: %s", getattr(result, "error", None) or "unknown error")
-    return "failed"
+    return "failed", result
+
+
+def _approval_send_outcome(future, timeout: float) -> str:
+    """Backward-compatible outcome-only wrapper for approval send tests/callers."""
+    outcome, _result = _approval_send_result(future, timeout)
+    return outcome
 
 
 def _resolve_progress_thread_id(
@@ -1027,14 +1033,12 @@ def _is_fresh_gateway_interruption(
 
 
 def build_resume_recovery_note(
-    reason: Optional[str], message: str = "", *, interactive: bool = True) -> str:
+    reason: Optional[str], message: str = "", *, interactive: bool = False,
+    recent_context: str = "") -> str:
     """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
 
-    Interactive platforms report the restore and ask what next; non-interactive ones finish the work.
-
-    On non-interactive event platforms (webhook, API server — adapters with ``interactive_resume = False``)
-    nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
-    abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
+    ``interactive`` is an explicit opt-in to the older "report the restore and
+    ask what next" behavior. The default quietly completes interrupted work.
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
@@ -1054,23 +1058,35 @@ def build_resume_recovery_note(
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
+            "No new user message accompanied this recovery, so do NOT emit "
+            "a 'session restored' acknowledgement or ask what to do next. "
+            "Treat the durable conversation history as the work checkpoint. "
+            "Silently reconstruct the requested outcome, the steps whose "
+            "results are proven, any external effects that remain uncertain, "
+            "and the next unfinished step. Then "
             "CONTINUE the interrupted task to completion.")
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step that has no recorded result.")
-    return (
+            "Preserve completed work and do NOT re-run tool calls whose "
+            "results already appear in the history. If an orphan-recovery "
+            "result says an external effect is UNKNOWN, inspect current "
+            "state before deciding whether a retry is safe. Resume from the "
+            "first unfinished step whose outcome is not already proven.")
+    note = (
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "
         f"Any restart/shutdown command in the history has already "
         f"run — do NOT re-execute or verify it. {resume_guidance} {tail_guidance}]"
-        + (f"\n\n{message}" if message else ""))
+    )
+    if recent_context:
+        note += f"\n\n{recent_context}"
+    if message:
+        note += f"\n\n[New message]\n{message}"
+    return note
 
 
 def _prepare_resume_pending_message(
-    reason: Optional[str], message: Optional[str], *, interactive: bool = True) -> tuple[str, str]:
+    reason: Optional[str], message: Optional[str], *, interactive: bool = True,
+    recent_context: str = "") -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
     Empty original: persist the note (a "" user row trips the pre-call sanitizer). Real text: persist clean.
@@ -1082,7 +1098,8 @@ def _prepare_resume_pending_message(
     words: the transcript stays scaffold-free (the model still receives the wrapped note), and a non-empty
     row never trips the sanitizer.
     """
-    recovery_message = build_resume_recovery_note(reason, message or "", interactive=interactive)
+    recovery_message = build_resume_recovery_note(
+        reason, message or "", interactive=interactive, recent_context=recent_context)
     persist_message = message if isinstance(message, str) and message.strip() else recovery_message
     return recovery_message, persist_message
 
@@ -3938,6 +3955,14 @@ class GatewayRunner(
         """Localized "restarting" / "shutting down" for the busy/drain notices shown in chat."""
         return t("gateway.busy.action_restarting") if self._restart_requested else t("gateway.busy.action_shutting_down")
 
+    def _drain_rejection_message(self) -> str:
+        if self._restart_requested:
+            return (
+                "I’m restarting for a moment and couldn’t save this message. "
+                "Please send it again shortly."
+            )
+        return "I’m going offline and couldn’t save this message. Please send it again when I’m back."
+
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         # ``active_work`` names each unit only while draining — that is when an observer (``hermes
         # update``) needs to know WHAT holds the gateway open; a per-turn write would be wasted I/O.
@@ -4211,6 +4236,7 @@ class GatewayRunner(
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
+            source=str(getattr(context, "turn_source", "") or ""),
             chat_id=context.source.chat_id,
             chat_type=str(context.source.chat_type) if context.source.chat_type else "",
             chat_name=context.source.chat_name or "",

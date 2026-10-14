@@ -167,3 +167,32 @@ Successful, complete pulls are cached in-process and on disk under `<hermes_home
 - **CI/CD** where an existing secrets-injection mechanism is already wired up — pick one path, not two.
 
 The good case for this is multi-machine fleets, shared dev boxes, gateway VPSes, or anywhere you want centralized rotation and revocation across multiple Hermes installations.
+
+## Load credentials when needed
+
+For a single-profile integration using Hermes's `get_secret` resolver, set
+`secrets.onepassword.lazy_sources: [conductor]` to defer mapped 1Password reads
+until that session source requests a credential. The default remains eager.
+This mode requires `cache_ttl_seconds: 0`, `profile_alias: false`, and 1Password as the only enabled
+external source; other configurations and multiplex gateways stay eager.
+Consumers reading `os.environ` directly are not on-demand consumers, so enable
+this only for an integration whose credential paths use the native resolver.
+
+Successful reads remain in the process environment as with eager startup. Failed
+reads are attempted once per process until the native secret-source cache reset.
+No unconfigured name is fetched. `cache_ttl_seconds: 0` continues to prevent disk
+caching. For MCP integrations, `mcp_servers.<name>.lazy: true` also postpones
+connection and credential interpolation until first use when a matching schema
+cache exists; a cache miss falls back to a live connection.
+
+An explicit profile secret scope still takes precedence over deferred process
+credentials. Audit dotenv mappings that overlap external names before opting in:
+a scope built before first use retains its existing dotenv value. Reads via the
+synchronous resolver block the calling thread; MCP first-use connection interpolation runs
+off the event loop. Existing-connection identity checks occur in the synchronous
+discovery path, which callers already run outside the MCP event loop. Cancellation prevents transport startup, while a bounded
+in-flight secret read may finish in its worker thread.
+
+First-use reads are serialized under the existing secret-source lock. A slow
+read can delay another credential consumer, but each subprocess has the native
+timeout and no additional credentials are prefetched.

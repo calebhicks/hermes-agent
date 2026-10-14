@@ -193,7 +193,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             platform TEXT NOT NULL,
             chat_id TEXT NOT NULL,
             thread_id TEXT,
+            reply_to TEXT,
             content TEXT NOT NULL,
+            payload_digest TEXT,
+            provider_intent_id TEXT,
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
@@ -204,8 +207,38 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             adapter_profile TEXT
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
-        add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    for name in ("adapter_profile", "reply_to", "payload_digest", "provider_intent_id"):
+        if name not in columns:
+            add_column_if_missing(conn, "delivery_obligations", name, f"{name} TEXT")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS delivery_ledger_meta (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            schema_version INTEGER NOT NULL
+        )"""
+    )
+    row = conn.execute(
+        "SELECT schema_version FROM delivery_ledger_meta WHERE singleton=1"
+    ).fetchone()
+    version = int(row[0]) if row else 0
+    if version == 0:
+        # Pre-linkage iMessage rows cannot prove whether a pending adapter
+        # intent owns the same provider mutation. Preserve them for inspection
+        # but never replay them after upgrade. Other platforms keep ordinary
+        # recovery semantics, and a rollback also ignores this new state.
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='legacy_hold', updated_at=?,
+                   last_error='pre-linkage iMessage obligation held without redelivery'
+               WHERE platform='imessage'
+                 AND state IN ('pending','attempting','failed')""",
+            (time.time(),),
+        )
+        conn.execute(
+            "INSERT INTO delivery_ledger_meta(singleton,schema_version) VALUES(1,2)"
+        )
+    elif version != 2:
+        raise RuntimeError("unsupported delivery ledger schema")
 
 
 def _transaction():
@@ -267,19 +300,27 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
 
 
+def compute_payload_digest(content: str) -> str:
+    """Exact digest shared with an adapter without duplicating its content."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      reply_to: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
+                reply_to, content, payload_digest, provider_intent_id,
+                state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+             str(reply_to) if reply_to else None, content, compute_payload_digest(content),
+             now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -305,6 +346,7 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
              session_key, content, since))
+        _prune_unlocked(conn, now)
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -317,6 +359,35 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def mark_terminal_no_redelivery(
+    obligation_id: str,
+    provider_intent_id: str = "",
+    reason: str = "mutation_uncertain",
+) -> None:
+    """Durably suppress an obligation whose provider may already have mutated."""
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='terminal_no_redelivery', updated_at=?,
+                   provider_intent_id=?, last_error=?
+               WHERE obligation_id=?""",
+            (
+                time.time(),
+                provider_intent_id[:200] if provider_intent_id else None,
+                reason[:500],
+                obligation_id,
+            ),
+        )
+
+
+def mark_redelivery_hold(
+    obligation_id: str,
+    reason: str = "adapter_redelivery_classification_hold",
+) -> None:
+    """Park an obligation that cannot be classified safely for redelivery."""
+    _update_state(obligation_id, "redelivery_hold", error=reason)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -349,7 +420,9 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
             (state, time.time(), error[:500] if error else None, obligation_id))
 
 
-def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
+def _claimed_row(
+    oid, session_key, platform, chat_id, thread_id, reply_to, content,
+    payload_digest, provider_intent_id, state, attempts, profile, *,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
                  last_error: Optional[str] = None) -> dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
@@ -359,7 +432,9 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
     released unsent goes back to ``failed`` with the same error and keeps its retry eligibility."""
     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
-            "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
+            "thread_id": thread_id, "reply_to": reply_to, "content": content,
+            "payload_digest": payload_digest, "provider_intent_id": provider_intent_id,
+            "state": state, "needs_marker": needs_marker,
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
             **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
@@ -390,12 +465,14 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
+                      reply_to, content, payload_digest, provider_intent_id,
+                      state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
+        for (oid, session_key, platform, chat_id, thread_id, reply_to, content,
+             payload_digest, provider_intent_id, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
@@ -420,7 +497,9 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 if cursor.rowcount:
                     claimed.append({
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
-                        "chat_id": chat_id, "thread_id": thread_id, "content": content,
+                        "chat_id": chat_id, "thread_id": thread_id, "reply_to": reply_to,
+                        "content": content, "payload_digest": payload_digest,
+                        "provider_intent_id": provider_intent_id, "state": state,
                         "profile": adapter_profile or "default", "attempts": attempts,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
                 continue
@@ -440,9 +519,10 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # mid-await, other rejection, a flood refusal whose earlier chunks the platform may have
                 # accepted, or a pending row an older build already claimed and may have sent) carries
                 # the marker.
-                claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
-                                            adapter_profile or "default",
-                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row))
+                claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id,
+                                            reply_to, content, payload_digest, provider_intent_id, state, attempts,
+                                            adapter_profile or "default", needs_marker=state != "pending" or attempts > 0,
+                                            flood=flood_row))
     return claimed
 
 
@@ -466,11 +546,13 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, attempts, created_at, owner_pid,
+                      reply_to, content, payload_digest, provider_intent_id,
+                      state, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
-        for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
+        for (oid, session_key, row_platform, chat_id, thread_id, reply_to, content,
+             payload_digest, provider_intent_id, state, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
@@ -499,7 +581,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # The failed send's ack may have been lost (reconnect) or its earlier chunks accepted
                 # (flood): every runtime redelivery carries a marker. The pre-claim error rides along so a
                 # claim released unsent keeps its flood retry eligibility.
-                claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
+                claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id,
+                                            reply_to, content, payload_digest, provider_intent_id, state,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
                                             flood=is_flood_error(last_error), last_error=last_error))
     return claimed
@@ -544,6 +627,7 @@ def _prune_unlocked(conn, now: float) -> None:
         conn.execute(
             """DELETE FROM delivery_obligations WHERE obligation_id IN (
                  SELECT obligation_id FROM delivery_obligations
+                 WHERE state IN ('delivered', 'abandoned')
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1

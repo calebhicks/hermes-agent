@@ -217,6 +217,7 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
         Platform.RELAY: PlatformConfig(enabled=True),
         Platform.SLACK: PlatformConfig(
             enabled=False,
+            gateway_restart_notification=True,
             home_channel=HomeChannel(
                 platform=Platform.SLACK,
                 chat_id="D123",
@@ -269,7 +270,7 @@ async def test_relay_restart_notification_uses_logical_platform_and_owner(tmp_pa
     runner.adapters = {Platform.RELAY: relay}
     runner.config.platforms = {
         Platform.RELAY: PlatformConfig(enabled=True),
-        Platform.SLACK: PlatformConfig(enabled=False),
+        Platform.SLACK: PlatformConfig(enabled=False, gateway_restart_notification=True),
     }
 
     delivered_target = await runner._send_restart_notification()
@@ -385,5 +386,3 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     await runner._notify_active_sessions_of_shutdown()
 
     adapter.send.assert_not_awaited()
-
-

@@ -24,6 +24,7 @@ from tools.delegate_tool import (
     delegate_task,
     _build_child_agent,
     _strip_blocked_tools,
+    _resolve_child_toolsets,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
@@ -165,6 +166,41 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertTrue(
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
+
+    def test_configured_child_block_wins_after_default_inheritance(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "conductor-cloud"]
+        parent.disabled_toolsets = []
+
+        with (
+            patch(
+                "tools.delegate_tool_toolsets._get_blocked_child_toolsets",
+                return_value=[" conductor-cloud "],
+            ),
+            patch(
+                "tools.delegate_tool_toolsets._canonical_toolset_name",
+                side_effect=lambda value: {
+                    "conductor-cloud": "mcp-conductor-cloud",
+                }.get(str(value).strip(), str(value).strip()),
+            ),
+        ):
+            enabled, disabled = _resolve_child_toolsets(parent, None, "leaf")
+
+        self.assertEqual(enabled, ["terminal"])
+        self.assertIn("conductor-cloud", disabled)
+        self.assertIn("mcp-conductor-cloud", disabled)
+
+    def test_malformed_configured_child_block_refuses_resolution(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "conductor-cloud"]
+        parent.disabled_toolsets = []
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"blocked_child_toolsets": "conductor-cloud"},
+        ):
+            with self.assertRaisesRegex(ValueError, "must be a list"):
+                _resolve_child_toolsets(parent, None, "leaf")
 
 
 class TestDelegateTask(unittest.TestCase):
@@ -322,7 +358,7 @@ class TestDelegateTask(unittest.TestCase):
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    str(Path(child_db.db_path).resolve()), str(Path(parent_db.db_path).resolve())
                 )
             finally:
                 if child_db is not None:

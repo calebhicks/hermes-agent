@@ -61,6 +61,9 @@ _SECRET_SOURCE_WRITES_BY_HOME: dict[str, dict[str, tuple[str, str, str | None]]]
 # HERMES_HOME paths already pulled external secrets for: load_hermes_dotenv() runs at import time from
 # several hot modules, so without this the Bitwarden status line prints 3-5x per startup and the config
 # re-parse + ASCII sweep re-run each time (Bitwarden's own cache only saves the network call).
+_DEFERRED_ONEPASSWORD: dict[str, dict] = {}
+_DEFERRED_ATTEMPTS: dict[str, set[str]] = {}
+_DEFERRED_RELOAD_HOMES: set[str] = set()
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
@@ -176,6 +179,9 @@ def hydrate_profile_secret_sources(hermes_home: str | os.PathLike) -> dict[str, 
 def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     """Locked implementation for :func:`hydrate_profile_secret_sources`."""
     home_key = str(home.resolve())
+    _DEFERRED_ONEPASSWORD.pop(home_key, None)
+    _DEFERRED_ATTEMPTS.pop(home_key, None)
+    _DEFERRED_RELOAD_HOMES.discard(home_key)
     if home_key in _APPLIED_HOMES:
         return get_secret_source_values(home)
 
@@ -241,6 +247,9 @@ def reset_secret_source_cache(hermes_home: str | os.PathLike | None = None) -> N
     a sibling's hydrated snapshot — the sibling's next scope build would run empty until it re-hydrated
     (#102041)."""
     if hermes_home is None:
+        _DEFERRED_RELOAD_HOMES.update(_DEFERRED_ONEPASSWORD)
+        _DEFERRED_ONEPASSWORD.clear()
+        _DEFERRED_ATTEMPTS.clear()
         _APPLIED_HOMES.clear()
         _SECRET_SOURCES.clear()
         _SOURCE_SUPPLIED_NAMES.clear()
@@ -249,6 +258,10 @@ def reset_secret_source_cache(hermes_home: str | os.PathLike | None = None) -> N
         _SECRET_SOURCE_WRITES_BY_HOME.clear()
         return
     home_key = str(Path(hermes_home).resolve())
+    if home_key in _DEFERRED_ONEPASSWORD:
+        _DEFERRED_RELOAD_HOMES.add(home_key)
+    _DEFERRED_ONEPASSWORD.pop(home_key, None)
+    _DEFERRED_ATTEMPTS.pop(home_key, None)
     _APPLIED_HOMES.discard(home_key)
     _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
     _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
@@ -288,14 +301,15 @@ def _format_offending_chars(value: str, limit: int = 3) -> str:
     return ", ".join(seen)
 
 
-def _sanitize_loaded_credentials() -> None:
+def _sanitize_loaded_credentials(names=None) -> None:
     """Strip non-ASCII from credential env vars (``_CREDENTIAL_SUFFIXES``) so the codebase never sees them.
 
     Emits a one-line warning to stderr when characters are stripped. Silent stripping would mask copy-paste
     corruption (Unicode lookalike glyphs from PDFs / rich-text editors, ZWSP from web pages) as opaque
     provider-side "invalid API key" errors (see #6843).
     """
-    for key, value in list(os.environ.items()):
+    items = os.environ.items() if names is None else ((k, os.environ[k]) for k in names if k in os.environ)
+    for key, value in list(items):
         if not any(key.endswith(suffix) for suffix in _CREDENTIAL_SUFFIXES):
             continue
         if value.isascii():
@@ -629,21 +643,82 @@ def _revoke_secret_source_writes(home_path: Path, *, keep) -> None:
         _SECRET_SOURCE_WRITES_BY_HOME.pop(home_key, None)
 
 
-def _apply_external_secret_sources(home_path: Path) -> None:
+def _can_defer_onepassword(cfg: dict) -> bool:
+    """Opt in only on named single-profile sources with unambiguous mapped precedence.
+
+    Other sources, aliases and multiplex hydration keep the eager native path.
+    This is a loading policy, never a grant to read an unconfigured credential.
+    """
+    from agent.secret_scope import is_multiplex_active
+    if not isinstance(cfg, dict):
+        return False
+    source = os.environ.get("HERMES_SESSION_SOURCE", "")
+    op = cfg.get("onepassword", {})
+    allowed = op.get("lazy_sources", []) if isinstance(op, dict) else []
+    enabled = [name for name, value in cfg.items()
+               if isinstance(value, dict) and value.get("enabled") is True]
+    return (not is_multiplex_active() and bool(source) and isinstance(allowed, list)
+            and source in allowed and enabled == ["onepassword"]
+            and cfg.get("profile_alias") is False
+            and op.get("cache_ttl_seconds", 300) == 0
+            and isinstance(op.get("env", {}), dict))
+
+
+def resolve_deferred_secret(name: str) -> str | None:
+    """Resolve one explicitly mapped name through the native source/precedence path.
+
+    Same once-per-process semantics as eager hydration, including failed attempts;
+    reset_secret_source_cache() permits an explicit retry. No new disk persistence.
+    """
+    if not _DEFERRED_ONEPASSWORD and not _DEFERRED_RELOAD_HOMES:
+        return
+    from hermes_constants import get_hermes_home
+    from agent.secret_scope import is_multiplex_active
+    if is_multiplex_active():
+        return
+    home = get_hermes_home()
+    key = str(home.resolve())
+    with _SECRET_SOURCE_CACHE_LOCK:
+        cfg = _DEFERRED_ONEPASSWORD.get(key)
+        if key in _DEFERRED_RELOAD_HOMES:
+            # Reset invalidates policy once, including for unmapped first reads.
+            _DEFERRED_RELOAD_HOMES.discard(key)
+            try:
+                cfg = _load_secrets_config(home)
+            except Exception:
+                return
+            if not _can_defer_onepassword(cfg):
+                _DEFERRED_ONEPASSWORD.pop(key, None)
+                return
+            _DEFERRED_ONEPASSWORD[key] = cfg
+        if not cfg or name not in cfg["onepassword"].get("env", {}):
+            return
+        attempted = _DEFERRED_ATTEMPTS.setdefault(key, set())
+        if name in attempted:
+            return os.environ.get(name)
+        attempted.add(name)
+        op = dict(cfg["onepassword"])
+        op["env"] = {name: op["env"][name]}
+        selected = dict(cfg, onepassword=op)
+        _apply_external_secret_sources(home, selected=selected)
+        return _SECRET_SOURCE_VALUES_BY_HOME.get(key, {}).get(name)
+
+
+def _apply_external_secret_sources(home_path: Path, *, selected: dict | None = None) -> None:
     """Pull secrets from every enabled external source into env — AFTER dotenv (sources need .env bootstrap
     tokens), BEFORE Hermes reads credentials; failures never block startup. Precedence/conflicts/provenance
     live in ``registry.apply_all``; this wrapper owns the once-per-home guard, the post-apply ASCII sweep,
     the ``_SECRET_SOURCES`` map and status lines."""
     home_key = str(Path(home_path).resolve())
-    if home_key in _APPLIED_HOMES:
+    if selected is None and home_key in _APPLIED_HOMES:
         return
 
     # Neither early return marks the home applied: a malformed config.yaml would otherwise permanently
     # disable secret loading for this process, and an unmarked home picks up a config change on the next
     # load (the signature-cached read is cheap).
     try:
-        cfg = _load_secrets_config(home_path)
-    except Exception:
+        cfg = selected if selected is not None else _load_secrets_config(home_path)
+    except Exception:  # noqa: BLE001 — config errors must not block startup
         # See #40597.
         return
     # No source configured / enabled any more: whatever one wrote earlier is no longer backed (#126982
@@ -651,6 +726,15 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     if not cfg:
         _revoke_secret_source_writes(home_path, keep=lambda _name, _source: False)
         return
+    if selected is None and _can_defer_onepassword(cfg):
+        _DEFERRED_ONEPASSWORD[home_key] = cfg
+        _DEFERRED_RELOAD_HOMES.discard(home_key)
+        return
+
+    if selected is None:
+        _DEFERRED_ONEPASSWORD.pop(home_key, None)
+        _DEFERRED_ATTEMPTS.pop(home_key, None)
+        _DEFERRED_RELOAD_HOMES.discard(home_key)
 
     # Defer the registry import until a source is enabled — bitwarden eagerly loads cryptography._rust.pyd,
     # which makes the Windows updater self-lock before its preflight. Detect by *shape* (dict with enabled
@@ -686,10 +770,11 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     # A real fetch attempt happened (success OR error): mark the home so the 3-5 import-time calls per
     # startup don't re-fetch / re-print (error retries are opt-in via reset_secret_source_cache()).
     # Marking AFTER the attempt keeps the earlier failure paths retryable.
-    _APPLIED_HOMES.add(home_key)
+    if selected is None:
+        _APPLIED_HOMES.add(home_key)
 
     if report.applied_any:
-        _sanitize_loaded_credentials()  # vault values carry the same copy-paste corruption risk as .env
+        _sanitize_loaded_credentials(report.provenance if selected is not None else None)
         for name, applied in report.provenance.items():
             _SECRET_SOURCES[name] = applied.source
 
@@ -706,13 +791,15 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         if name in os.environ:
             values[name] = os.environ[name]
     _record_secret_source_writes(home_key, report, supplied, environ_before)
-    if values:
+    if selected is not None:
+        _SECRET_SOURCE_VALUES_BY_HOME.setdefault(home_key, {}).update(values)
+    elif values:
         _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
     _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
         n: values[n] for n, a in report.provenance.items() if a.authoritative and n in values}
 
     for src in report.sources:
-        if src.applied:
+        if src.applied and selected is None:
             print(f"  {src.label}: applied {len(src.applied)} "
                   f"secret{'s' if len(src.applied) != 1 else ''}", file=sys.stderr)
         if src.result.error:

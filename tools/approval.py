@@ -118,6 +118,97 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_prompt_index: dict[tuple[str, str, str], tuple[str, str]] = {}
+
+
+def _approval_prompt_key(
+    platform: object,
+    chat_id: object,
+    prompt_message_id: object,
+) -> tuple[str, str, str] | None:
+    platform_value = getattr(platform, "value", platform)
+    key = (
+        str(platform_value or "").strip().lower(),
+        str(chat_id or "").strip(),
+        str(prompt_message_id or "").strip(),
+    )
+    if not all(key):
+        return None
+    return key
+
+
+def _drop_prompt_bindings_for_request(session_key: str, request_id: str) -> None:
+    for prompt_key, target in list(_gateway_prompt_index.items()):
+        if target == (session_key, request_id):
+            _gateway_prompt_index.pop(prompt_key, None)
+
+
+def bind_gateway_approval_prompt(
+    *,
+    session_key: str,
+    request_id: str,
+    platform: object,
+    chat_id: object,
+    prompt_message_id: object,
+) -> bool:
+    """Bind a confirmed outbound approval prompt to its pending request."""
+    session_key = str(session_key or "").strip()
+    request_id = str(request_id or "").strip()
+    prompt_key = _approval_prompt_key(platform, chat_id, prompt_message_id)
+    if not session_key or not request_id or prompt_key is None:
+        return False
+    with _lock:
+        if not any(
+            entry.data.get("request_id") == request_id
+            for entry in _gateway_queues.get(session_key, [])
+        ):
+            return False
+        _gateway_prompt_index[prompt_key] = (session_key, request_id)
+        return True
+
+
+def bind_gateway_approval_when_sent(future, *, session_key: str, request_id: str,
+                                    platform: object, chat_id: object) -> None:
+    """Recover a late provider ack without resending or falling back to FIFO.
+
+    The captured request id cannot bind a later request in the same session;
+    bind_gateway_approval_prompt refuses when this request has already expired.
+    """
+    def confirmed(done):
+        try:
+            result = done.result()
+        except Exception:
+            return
+        if getattr(result, "success", False) is True:
+            bind_gateway_approval_prompt(session_key=session_key, request_id=request_id,
+                platform=platform, chat_id=chat_id,
+                prompt_message_id=getattr(result, "message_id", None))
+    future.add_done_callback(confirmed)
+
+
+def resolve_gateway_approval_by_prompt(
+    *,
+    platform: object,
+    chat_id: object,
+    prompt_message_id: object,
+    choice: str,
+    reason: Optional[str] = None,
+) -> int:
+    """Resolve the exact approval request addressed by a prompt reply."""
+    prompt_key = _approval_prompt_key(platform, chat_id, prompt_message_id)
+    if prompt_key is None:
+        return 0
+    with _lock:
+        target = _gateway_prompt_index.pop(prompt_key, None)
+    if target is None:
+        return 0
+    session_key, request_id = target
+    return resolve_gateway_approval(
+        session_key,
+        choice,
+        reason=reason,
+        request_id=request_id,
+    )
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -132,8 +223,13 @@ def unregister_gateway_notify(session_key: str) -> None:
     they don't hang forever (agent run finished or interrupted)."""
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
-        for entry in _gateway_queues.pop(session_key, []):
-            entry.event.set()
+        entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            request_id = str(entry.data.get("request_id") or "")
+            if request_id:
+                _drop_prompt_bindings_for_request(session_key, request_id)
+    for entry in entries:
+        entry.event.set()
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -156,9 +252,12 @@ def resolve_gateway_approval(session_key: str, choice: str,
                 return 0
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = [entry for entry in queue
+                       if choice == "deny" or not entry.data.get("require_prompt_binding")]
+            queue[:] = [entry for entry in queue if entry not in targets]
         else:
+            if choice != "deny" and queue[0].data.get("require_prompt_binding"):
+                return 0
             targets = [queue.pop(0)]
         if not queue:
             _gateway_queues.pop(session_key, None)
@@ -166,6 +265,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
         # ``_drop_entry`` reads ``entry.result`` under this same lock after its deadline check, so a
         # choice acked to the client here can never be popped-and-lost as a timeout (#112548).
         for entry in targets:
+            _drop_prompt_bindings_for_request(session_key, str(entry.data.get("request_id") or ""))
             entry.result = choice
             if reason:
                 entry.reason = reason
@@ -186,6 +286,7 @@ def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> 
         if not queue:
             _gateway_queues.pop(session_key, None)
         entry.cancelled = cause
+        _drop_prompt_bindings_for_request(session_key, request_id)
         entry.event.set()
     return True
 
@@ -295,6 +396,7 @@ def clear_session(session_key: str) -> None:
             # Cancel blocked waits now so the old run unwinds instead of idling until timeout;
             # the prompt was withdrawn, nobody denied it.
             entry.cancelled = "the session ended before the prompt was answered"
+            _drop_prompt_bindings_for_request(session_key, str(entry.data.get("request_id") or ""))
             entry.event.set()
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
@@ -773,7 +875,9 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
-                    is_ask: bool, smart: bool = False, pending_body=None) -> dict:
+                    is_ask: bool, smart: bool = False,
+                    permanent_capable: bool = True, pending_body=None,
+                    always_prompt: bool = False, require_prompt_binding: bool = False) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
@@ -789,7 +893,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = not smart_denied
+    allow_permanent = permanent_capable and not smart_denied and not always_prompt
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -803,7 +907,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        if not smart_denied and not always_prompt:
             _persist_choice(session_key, choice, pattern_keys)
         if spec.user_approved:
             return _user_approved(session_key, description)
@@ -838,8 +942,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": permanent_capable and not smart_denied and not always_prompt,
+                "allow_session": not smart_denied and not always_prompt,
+                "require_prompt_binding": require_prompt_binding,
             }
             if smart_denied:
                 data["smart_denied"] = True
@@ -948,6 +1053,8 @@ def _run_approval_gate(
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
+    always_prompt: bool = False,
+    require_prompt_binding: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -964,15 +1071,20 @@ def _run_approval_gate(
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
-    if _yolo_active() or approval_context._get_approval_mode() == "off":
+    if not always_prompt and (_yolo_active() or approval_context._get_approval_mode() == "off"):
         return _approved()
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not always_prompt and is_approved(session_key, pattern_key):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     if not is_cli and not is_gateway and not is_ask:
         log_args = (autoapprove_log_prefix, pattern_key, description)
+        if always_prompt:
+            return _blocked(no_human_block_message or (
+                f"BLOCKED: approval required ({description}) but no "
+                "interactive user or gateway is present to approve it."),
+                pattern_key=pattern_key, description=description)
         # Every unattended context resolves instantly — never a pending approval nobody can answer.
         deny_messages = {
             "single_query": single_query_deny_message, "cron": cron_deny_message,
@@ -1012,6 +1124,7 @@ def _run_approval_gate(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        always_prompt=always_prompt, require_prompt_binding=require_prompt_binding,
     )
 
 
@@ -1095,7 +1208,16 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
+def request_tool_approval(
+    tool_name: str,
+    reason: str,
+    *,
+    rule_key: str = "",
+    approval_callback=None,
+    always_prompt: bool = False,
+    display_target: Optional[str] = None,
+    require_prompt_binding: bool = False,
+) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
     Entry point for a plugin ``pre_tool_call`` hook returning ``{"action": "approve", ...}``:
@@ -1105,7 +1227,17 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
     context without an approval bridge fails CLOSED. ``rule_key`` controls the ``[a]lways``
     allowlist grain; when empty it is ``tool_name`` + a hash of ``reason`` so DISTINCT reasons
     on the same tool persist independently. Returns the ``check_dangerous_command`` result shape.
+    ``display_target`` optionally shows the complete operation in the native
+    command preview. Callers must respect the platform's preview size bound.
     """
+    if require_prompt_binding:
+        from agent.redact import redact_sensitive_text
+        always_prompt = True
+        if (not _is_gateway_approval_context()
+                or _gateway_notify_cb(get_current_session_key()) is None
+                or redact_sensitive_text(display_target or "", force=True) != (display_target or "")):
+            return _blocked("Exact approval requires an unredacted gateway prompt.",
+                            pattern_key="plugin_rule:" + (rule_key or tool_name), description=reason)
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
         rule_key = f"{tool_name}:{hashlib.sha256(description.encode('utf-8')).hexdigest()[:12]}"
@@ -1114,12 +1246,13 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
         # Namespaced so plugin-rule approvals share the allowlist machinery without ever colliding with a real
         # command pattern key; the display target is a synthetic label for the display/allowlist layer.
         pattern_key=f"plugin_rule:{rule_key}", description=description,
-        display_target=f"<{tool_name}> (plugin approval rule)", approval_callback=approval_callback,
+        display_target=display_target if display_target is not None else f"<{tool_name}> (plugin approval rule)", approval_callback=approval_callback,
         subject=subject, advice="Find an alternative approach.",
         autoapprove_log_prefix=f"plugin-escalated tool call '{tool_name}' in non-interactive non-gateway context",
         fail_closed_when_no_human=True,
         no_human_block_message=(f"BLOCKED: {subject} but no interactive user or gateway is present "
                                 "to approve it. A plugin flagged this action for human confirmation."),
+        always_prompt=always_prompt, require_prompt_binding=require_prompt_binding,
     )
 
 

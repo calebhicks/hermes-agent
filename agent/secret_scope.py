@@ -233,7 +233,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = bound.mapping.get(name)
         if val is not None:
             return val
-        return default if serves_routed_profile() else _environ_or(name, default)
+        return default if is_multiplex_active() or serves_routed_profile() else _environ_or(name, default)
     if is_multiplex_active():
         raise UnscopedSecretError(
             name,
@@ -244,7 +244,12 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
             f"profile's value. See website/docs/developer-guide/multiplexing-gateway.md "
             f"(Workstream A).",
         )
-    return _environ_or(name, default)
+    try:
+        from hermes_cli.env_loader import resolve_deferred_secret
+    except ImportError:
+        return _environ_or(name, default)
+    resolved = resolve_deferred_secret(name)
+    return resolved if resolved is not None else _environ_or(name, default)
 
 
 def get_secret_str(name: str, default: str = "") -> str:

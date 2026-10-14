@@ -2042,6 +2042,7 @@ class GatewayTurnMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
+        resume_context: str = ""
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2052,7 +2053,41 @@ class GatewayTurnMixin:
         from tools.approval_yolo import restore_session_yolo
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         restore_session_yolo(session_key, session_entry.yolo is True)  # a restarted gateway's set starts empty
+        if _is_new_session:
+            adapter = self._delivery_adapter_for(source)
+            if adapter is not None:
+                try:
+                    start_context = await adapter.session_start_context(event)
+                except Exception:
+                    logger.warning(
+                        "Platform session-start context hook failed category=adapter_exception"
+                    )
+                else:
+                    if start_context:
+                        existing = str(getattr(event, "channel_context", "") or "")
+                        event.channel_context = (
+                            f"{start_context}\n\n{existing}"
+                            if existing else str(start_context)
+                        )
+        resume_context = ""
+        if getattr(session_entry, "resume_pending", False):
+            adapter = self._delivery_adapter_for(source)
+            if adapter is not None:
+                try:
+                    resume_context = str(await adapter.session_resume_context(source) or "")
+                except Exception:
+                    logger.warning(
+                        "Platform session-resume context hook failed category=adapter_exception"
+                    )
         context = build_session_context(source, self.config, session_entry)
+        # Carry provenance on this turn's private SessionContext so the
+        # existing _set_session_env(context) boundary stays compatible with
+        # adapters/tests that wrap it. Missing provenance fails closed.
+        context.turn_source = (
+            "gateway_internal"
+            if bool(getattr(event, "internal", False))
+            else "gateway_inbound"
+        )
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
@@ -2137,7 +2172,7 @@ class GatewayTurnMixin:
                  if event.message_id else str(uuid.uuid4()))
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
-            persist_user_display_kind, session_entry.session_id, owner,
+            persist_user_display_kind, session_entry.session_id, owner, resume_context=resume_context,
             title_user_message=title_user_message,
         ), _session_env_tokens
 
@@ -2208,6 +2243,7 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
+                resume_context=prepared.resume_context,
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
@@ -4197,7 +4233,6 @@ class GatewayTurnMixin:
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
-        _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
@@ -4214,28 +4249,8 @@ class GatewayTurnMixin:
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
                 break
-            _elapsed_mins = int((time.time() - _notify_start) // 60)
-            # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
-            _status_detail = ""
-            _want_iteration_detail = bool(
-                disp.resolve_display_setting(disp.user_config, disp.platform_key, "busy_ack_detail", True)
-            )
-            _a = self._agent_activity_summary(agent_holder[0])
-            with suppress(Exception):
-                if _a:
-                    _parts = []
-                    if _want_iteration_detail:
-                        _parts.append(format_iteration_progress(_a["api_call_count"], _a["max_iterations"]))
-                    _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                    if _action:
-                        _parts.append(str(_action))
-                    if _parts:
-                        _status_detail = " — " + ", ".join(_parts)
-            _heartbeat_text = (
-                disp._generic_status_phrase("status")
-                if _long_running_mode == "generic"
-                else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
-            )
+            # Heartbeats never expose tool names, arguments, or activity text.
+            _heartbeat_text = disp._generic_status_phrase("status")
             try:
                 _notify_res = None
                 if _heartbeat_msg_id:
@@ -4274,6 +4289,7 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        resume_context: str = "",
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4313,6 +4329,7 @@ class GatewayTurnMixin:
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
+            resume_context=resume_context,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

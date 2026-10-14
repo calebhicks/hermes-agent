@@ -148,12 +148,8 @@ def _result_is_error(result) -> bool:
 
 
 def _record_call_outcome(server_name: str, result) -> Any:
-    """Breaker bookkeeping: an error payload from the tool itself still counts as a strike (#10447),
-    flagged as an application error so the open-breaker message stays truthful."""
-    if _result_is_error(result):
-        _core._bump_server_error(server_name, application=True)
-    else:
-        _core._reset_server_error(server_name)
+    """A completed RPC proves transport health, including application errors."""
+    _core._reset_server_error(server_name)
     return result
 
 
@@ -178,15 +174,15 @@ def _lookup_reconnectable_server(server_name: str, require_loop: bool = False):
 
 
 def _retry_once(server_name: str, retry_call, op_description: str, what: str):
-    """Re-run ``retry_call`` after a recovery step. Returns the result when the RPC completed
-    (an application error is still the tool's real answer, and still a breaker strike per #10447);
-    None when the retry raised (caller falls through)."""
+    """Re-run ``retry_call`` after a recovery step. Returns the result (closing the breaker)
+    including application errors; None when the retry raises (caller falls through)."""
     try:
         result = retry_call()
     except Exception as retry_exc:
         logger.warning("MCP %s/%s retry after %s failed: %s", server_name, op_description, what, retry_exc)
         return None
-    return _record_call_outcome(server_name, result)
+    _core._reset_server_error(server_name)
+    return result
 
 
 def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str):
@@ -210,9 +206,13 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
             _core._reset_server_error(server_name)
         result = _retry_once(server_name, retry_call, op_description, "auth recovery")
         if result is not None:
-            return result
-    return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name, detail=_auth_error_detail(exc)),
-                   needs_reauth=True, server=server_name)
+            # A completed application failure is normally healthy transport,
+            # but an auth failure after refresh remains terminal needs_reauth.
+            if not (_result_is_error(result) and any(marker in str(result).lower()
+                    for marker in ("401", "403", "unauthorized", "forbidden", "needs_reauth", "invalid_token",
+                                   "authentication required", "token expired", "expired token", "invalid credentials"))):
+                return result
+    return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name, detail=_auth_error_detail(exc)), needs_reauth=True, server=server_name)
 
 
 def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str,

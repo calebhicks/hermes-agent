@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import re
+import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
@@ -32,6 +33,7 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_CONSULT_PREFETCH_READINESS_S = 15.0
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -88,6 +90,8 @@ def memory_provider_tools_enabled(enabled_toolsets: Optional[list[str]], disable
     if not enabled_toolsets:
         return False
     if "memory" in enabled_toolsets:
+        return True
+    if "gbrain_read" in enabled_toolsets and "gbrain_read" not in (disabled_toolsets or []):
         return True
     try:
         from toolsets import resolve_toolset
@@ -147,6 +151,8 @@ def inject_memory_provider_tools(agent: Any) -> int:
     added = 0
     for raw_schema in get_schemas():
         schema = normalize_tool_schema(raw_schema)
+        if schema is not None and not memory_provider_tool_allowed(agent, schema["name"]):
+            continue
         if schema is None:
             logger.warning(
                 "Memory provider returned a tool schema with no resolvable "
@@ -157,7 +163,26 @@ def inject_memory_provider_tools(agent: Any) -> int:
             agent.valid_tool_names.add(schema["name"])
             existing_tool_names.add(schema["name"])
             added += 1
+    if "gbrain_read" in (getattr(agent, "enabled_toolsets", None) or []):
+        from gateway.session_context import get_session_env
+        context_id = get_session_env("HERMES_CONSULT_CONTEXT_ID", "")
+        nonce = get_session_env("HERMES_CONSULT_WORKER_NONCE", "")
+        if get_session_env("HERMES_SESSION_SOURCE", "") == "conductor" and context_id and nonce:
+            print("CONDUCTOR_CONTEXT " + json.dumps({
+                "kind": "tools", "context_id": context_id, "nonce": nonce,
+                "session_id": getattr(agent, "session_id", ""),
+                "tools": sorted(t for t in existing_tool_names if t == "gbrain_lookup"),
+            }), file=sys.stderr, flush=True)
     return added
+
+
+def memory_provider_tool_allowed(agent: Any, name: str) -> bool:
+    """Use the same fixed provider boundary at discovery and both dispatch paths."""
+    if not memory_provider_tools_exposed(agent):
+        return False
+    if "gbrain_read" in (getattr(agent, "enabled_toolsets", None) or []):
+        return name == "gbrain_lookup"
+    return True
 
 
 # -- Context fencing helpers --------------------------------------------------
@@ -525,6 +550,21 @@ class MemoryManager:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
+        # The consultation provider gets its 15s readiness window plus the
+        # ordinary external-call budget. Report what the manager actually
+        # returns; a late daemon-thread result must never certify injection.
+        from gateway.session_context import get_session_env
+        nonce = get_session_env("HERMES_CONSULT_WORKER_NONCE", "")
+        consult = (provider.name == "gbrain" and get_session_env("HERMES_SESSION_SOURCE", "") == "conductor"
+                   and bool(re.fullmatch(r"[a-f0-9]{64}", nonce))
+                   and bool(get_session_env("HERMES_CONSULT_CONTEXT_ID", "")))
+        timeout = _CONSULT_PREFETCH_READINESS_S + self._external_prefetch_timeout if consult else self._external_prefetch_timeout
+        def delivery(status: str) -> None:
+            if consult:
+                print("CONDUCTOR_CONTEXT " + json.dumps({
+                    "kind": "recall_delivery", "context_id": get_session_env("HERMES_CONSULT_CONTEXT_ID", ""),
+                    "nonce": nonce, "session_id": session_id, "status": status,
+                }), file=sys.stderr, flush=True)
         result_box: dict[str, Any] = {}
 
         def _run() -> None:
@@ -538,22 +578,25 @@ class MemoryManager:
             existing = self._external_prefetch_threads.get(provider.name)
             if existing is not None and existing.is_alive():
                 logger.debug("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
+                delivery("timeout")
                 return ""
             self._external_prefetch_threads[provider.name] = thread
             thread.start()
 
-        thread.join(self._external_prefetch_timeout)
+        thread.join(timeout)
         if thread.is_alive():
             logger.warning(
                 "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
-                "the stuck call returns", provider.name, self._external_prefetch_timeout,
+                "the stuck call returns", provider.name, timeout,
             )
+            delivery("timeout")
             return ""
 
         with self._external_prefetch_lock:
             if self._external_prefetch_threads.get(provider.name) is thread:
                 self._external_prefetch_threads.pop(provider.name, None)
         if "error" in result_box:
+            delivery("failed")
             raise result_box["error"]
         result = result_box.get("value", "")
         if result and result.strip():
@@ -563,6 +606,7 @@ class MemoryManager:
                 result, session_id=session_id, source=f"{provider.name} memory prefetch",
                 config=self._external_prefetch_spill_config,
             )
+        delivery("injected" if result and result.strip() else "empty")
         return result
 
     def describe_recall(self) -> str:

@@ -449,7 +449,10 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER, compute_payload_digest, mark_delivered,
+                mark_failed, mark_redelivery_hold, mark_terminal_no_redelivery,
+            )
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -462,12 +465,77 @@ class GatewayStartupMixin:
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
+            hook = getattr(type(adapter), "delivery_obligation_redelivery_disposition", None)
+            if hook is None:
+                hook = getattr(getattr(adapter, "__dict__", {}), "get", lambda *_: None)(
+                    "delivery_obligation_redelivery_disposition"
+                )
+            if callable(hook):
+                try:
+                    disposition = await adapter.delivery_obligation_redelivery_disposition(row)
+                except Exception:
+                    logger.warning(
+                        "obligation %s: adapter redelivery classification failed; holding",
+                        row["obligation_id"],
+                    )
+                    disposition = "hold"
+            else:
+                disposition = "redeliver"
+            if disposition not in {"redeliver", "terminal_no_redelivery", "hold"}:
+                logger.warning(
+                    "obligation %s: invalid adapter redelivery disposition; holding",
+                    row["obligation_id"],
+                )
+                disposition = "hold"
+            if disposition == "terminal_no_redelivery":
+                with _log_suppressed(logging.DEBUG, "delivery ledger terminal update failed", exc_info=True):
+                    await asyncio.to_thread(
+                        mark_terminal_no_redelivery,
+                        row["obligation_id"],
+                        str(row.get("provider_intent_id") or ""),
+                        "adapter_linked_mutation_uncertain",
+                    )
+                logger.warning(
+                    "obligation %s: exact provider intent suppresses startup redelivery",
+                    row["obligation_id"],
+                )
+            elif disposition == "hold":
+                with _log_suppressed(logging.DEBUG, "delivery ledger hold update failed", exc_info=True):
+                    await asyncio.to_thread(
+                        mark_redelivery_hold,
+                        row["obligation_id"],
+                        "adapter_redelivery_classification_hold",
+                    )
+                logger.warning(
+                    "obligation %s: adapter evidence is insufficient; held without redelivery",
+                    row["obligation_id"],
+                )
+            if disposition in {"terminal_no_redelivery", "hold"}:
+                continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            metadata = {}
+            if row.get("thread_id"):
+                metadata["thread_id"] = row["thread_id"]
+            if row.get("reply_to"):
+                metadata["reply_to"] = row["reply_to"]
+            if adapter.requires_delivery_obligation is True:
+                metadata["_hermes_delivery_obligation"] = {
+                    "obligation_id": row["obligation_id"],
+                    "payload_digest": row.get("payload_digest") or "",
+                    "send_payload_digest": compute_payload_digest(content),
+                    "chat_id": str(row["chat_id"]),
+                    "thread_id": str(row.get("thread_id") or ""),
+                    "reply_to": str(row.get("reply_to") or ""),
+                }
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                result = await adapter.send(
+                    chat_id=row["chat_id"],
+                    content=content,
+                    reply_to=row.get("reply_to"),
+                    metadata=metadata or None,
+                )
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
@@ -580,22 +648,40 @@ class GatewayStartupMixin:
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
 
-    def _resume_owner_authorized(self, session_key: str, source) -> bool:
+    async def _resume_owner_authorized(self, session_key: str, source, adapter) -> bool:
         """Validate the session owner against the CURRENT allowlist: a session created before the
         allowlist existed (or whose owner was since removed) must not silently receive a full agent
         response just because it carries a resume marker."""
         try:
-            if self._is_user_authorized_for_source(source):
+            adapter_decision = await adapter.authorize_persisted_source(source)
+        except Exception:
+            logger.warning(
+                "Skipping auto-resume for %s: adapter authorization hook failed "
+                "category=adapter_exception",
+                session_key,
+            )
+            return False
+        try:
+            authorized = (
+                self._is_user_authorized_for_source(source)
+                if adapter_decision is None
+                else bool(adapter_decision)
+            )
+            if authorized:
                 return True
             logger.warning(
-                "Skipping auto-resume for %s: session owner is no "
-                "longer authorized under the current allowlist", session_key,
+                "Skipping auto-resume for %s: persisted source is no longer authorized",
+                session_key,
             )
-        except Exception as exc:
-            logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
+        except Exception:
+            logger.warning(
+                "Skipping auto-resume for %s: authorization check failed "
+                "category=gateway_exception",
+                session_key,
+            )
         return False
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+    async def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
@@ -604,7 +690,7 @@ class GatewayStartupMixin:
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
         window = _auto_continue_freshness_window()
-        candidates = self._resume_pending_candidates(platform)
+        candidates = await asyncio.to_thread(self._resume_pending_candidates, platform)
         if candidates is None:
             return 0
         scheduled = 0
@@ -625,7 +711,7 @@ class GatewayStartupMixin:
                     getattr(source.platform, "value", source.platform),
                 )
                 continue
-            if not self._resume_owner_authorized(entry.session_key, source):
+            if not await self._resume_owner_authorized(entry.session_key, source, adapter):
                 continue
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
@@ -1533,7 +1619,7 @@ class GatewayStartupMixin:
             recover_gateway_pending(self)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
-        self._schedule_resume_pending_sessions()
+        await self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.

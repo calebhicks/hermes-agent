@@ -287,8 +287,7 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
 
     response = await runner._handle_message(event)
 
-    assert isinstance(response, str)
-    assert "queued" in response
+    assert response is None
     assert adapter._pending_messages[session_key] is event
     agent.interrupt.assert_not_called()
 
@@ -578,3 +577,21 @@ async def test_secondary_human_delay_follows_profile_config_not_process_env(tmp_
     # A fresh adapter is off until the runner installs a range; env is never consulted.
     fresh = _adapter()
     assert fresh._human_delay_range_ms is None and fresh._get_human_delay() == 0.0
+def test_adapter_source_busy_mode_precedes_profile_default():
+    runner = _runner(default_mode="steer")
+    adapter = _adapter()
+    adapter.busy_input_mode_for_source = MagicMock(return_value="queue")
+    runner.adapters[Platform.TELEGRAM] = adapter
+    source = _event(profile=None).source
+
+    assert runner._effective_busy_input_mode(source) == "queue"
+    adapter.busy_input_mode_for_source.assert_called_once_with(source)
+
+
+def test_invalid_adapter_source_busy_mode_preserves_default():
+    runner = _runner(default_mode="interrupt")
+    adapter = _adapter()
+    adapter.busy_input_mode_for_source = MagicMock(return_value="invalid")
+    runner.adapters[Platform.TELEGRAM] = adapter
+
+    assert runner._effective_busy_input_mode(_event(profile=None).source) == "interrupt"

@@ -1203,6 +1203,31 @@ class TestMemoryInjectionRejectsMalformedSchema:
         assert names == {"good_tool"}
         assert agent.valid_tool_names == {"good_tool"}
 
+    def test_gbrain_read_scope_blocks_other_provider_tools_and_builtin_writes(self):
+        from agent.memory_manager import memory_provider_tool_allowed
+        from agent.inline_tool_executors import resolve_invoke_tool_executor
+        from agent.tool_executor import _resolve_sequential_dispatch
+        from toolsets import resolve_toolset
+        agent = self._agent_with(*[{"name": name, "parameters": {}} for name in ("gbrain_lookup", "memory_write", "new_management_tool")])
+        agent.enabled_toolsets = ["gbrain_read"]
+        agent._context_engine_tool_names = set()
+        assert inject_memory_provider_tools(agent) == 1
+        assert agent.valid_tool_names == {"gbrain_lookup"}
+        from tools.mcp_tool_agent import _reinject_post_build_tools
+        rebuilt, names = [], set()
+        _reinject_post_build_tools(agent, rebuilt, names)
+        assert names == {"gbrain_lookup"}
+        assert "memory" not in resolve_toolset("gbrain_read")
+        assert memory_provider_tool_allowed(agent, "gbrain_lookup")
+        for name in ("memory", "delegate_task", "session_search", "memory_write", "new_management_tool"):
+            assert not memory_provider_tool_allowed(agent, name)
+            execute = resolve_invoke_tool_executor(agent, name)
+            assert "outside" in execute(agent, {}, None)
+            ref = SimpleNamespace(name=name, args={}, task_id="test", call_id="call", trace=[])
+            assert "outside" in _resolve_sequential_dispatch(agent, ref, []).execute({})
+        agent.disabled_toolsets = ["memory"]
+        assert not memory_provider_tool_allowed(agent, "gbrain_lookup")
+
 
 class TestTrivialPromptClassifier:
     """is_trivial_prompt — the shared gate for core prefetch + provider injection."""
@@ -1304,3 +1329,44 @@ class TestSystemPromptGateParity:
         assert added == 1
         names = {t["function"]["name"] for t in agent.tools}
         assert "mnemosyne_remember" in names
+
+
+def _consult_recall_env(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "conductor")
+    monkeypatch.setenv("HERMES_CONSULT_CONTEXT_ID", "fixture-context")
+    monkeypatch.setenv("HERMES_CONSULT_WORKER_NONCE", "a" * 64)
+
+
+def test_consult_manager_allows_readiness_and_reports_actual_delivery(monkeypatch, capsys):
+    _consult_recall_env(monkeypatch)
+    provider = FakeMemoryProvider("gbrain")
+    provider._prefetch_result = "Remembered context"
+    mgr = MemoryManager()
+    joins = []
+    real_join = threading.Thread.join
+    def join(thread, timeout=None):
+        joins.append(timeout)
+        return real_join(thread, timeout)
+    monkeypatch.setattr(threading.Thread, "join", join)
+    assert mgr._prefetch_provider(provider, "actual question", session_id="fixture") == "Remembered context"
+    assert joins == [23.0]
+    events = [json.loads(l.split(" ", 1)[1]) for l in capsys.readouterr().err.splitlines() if l.startswith("CONDUCTOR_CONTEXT ")]
+    assert events[-1]["kind"] == "recall_delivery"
+    assert events[-1]["status"] == "injected"
+
+
+def test_late_consult_recall_never_reports_delivery(monkeypatch, capsys):
+    _consult_recall_env(monkeypatch)
+    import agent.memory_manager as mm
+    monkeypatch.setattr(mm, "_CONSULT_PREFETCH_READINESS_S", 0.01)
+    mgr = MemoryManager(external_prefetch_timeout=0.01)
+    provider = BlockingPrefetchProvider("gbrain")
+    provider._prefetch_result = "Late context"
+    try:
+        assert mgr._prefetch_provider(provider, "actual question", session_id="fixture") == ""
+        event = json.loads(capsys.readouterr().err.split("CONDUCTOR_CONTEXT ")[-1])
+        assert event["status"] == "timeout"
+    finally:
+        provider.release.set()
+        mgr._external_prefetch_threads["gbrain"].join(1)
+    assert "recall_delivery" not in capsys.readouterr().err

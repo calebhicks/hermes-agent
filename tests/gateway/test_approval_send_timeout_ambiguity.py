@@ -21,13 +21,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from gateway.run import _approval_send_outcome
+from gateway.run import _approval_send_outcome, _approval_send_result
 
 
 class _Result:
-    def __init__(self, success, error=None):
+    def __init__(self, success, error=None, message_id=None):
         self.success = success
         self.error = error
+        self.message_id = message_id
 
 
 def test_timeout_is_ambiguous_not_failure():
@@ -46,6 +47,22 @@ def test_success_is_sent():
     assert _approval_send_outcome(fut, timeout=1) == "sent"
 
 
+def test_success_preserves_confirmed_message_id_for_prompt_binding():
+    fut = MagicMock()
+    fut.result.return_value = _Result(True, message_id="prompt-123")
+    outcome, result = _approval_send_result(fut, timeout=1)
+    assert outcome == "sent"
+    assert result.message_id == "prompt-123"
+
+
+def test_timeout_has_no_confirmed_message_id_for_prompt_binding():
+    fut = MagicMock()
+    fut.result.side_effect = concurrent.futures.TimeoutError()
+    outcome, result = _approval_send_result(fut, timeout=0.01)
+    assert outcome == "ambiguous"
+    assert result is None
+
+
 def test_definitive_error_result_is_failed():
     fut = MagicMock()
     fut.result.return_value = _Result(False, "relay prompt op unavailable")
@@ -60,3 +77,37 @@ def test_non_timeout_exception_is_failed():
 
 def test_missing_future_is_failed():
     assert _approval_send_outcome(None, timeout=1) == "failed"
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_late_ack_binds_only_the_original_pending_request(monkeypatch, expired):
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+    original = _ApprovalEntry({"request_id": "original", "require_prompt_binding": True})
+    newer = _ApprovalEntry({"request_id": "newer"})
+    monkeypatch.setattr(approval, "_gateway_queues", {"session": [original]})
+    monkeypatch.setattr(approval, "_gateway_prompt_index", {})
+    future = concurrent.futures.Future()
+    approval.bind_gateway_approval_when_sent(future, session_key="session", request_id="original",
+        platform="slack", chat_id="dm")
+    if expired:
+        approval._gateway_queues["session"] = [newer]
+    future.set_result(_Result(True, message_id="late-card"))
+    count = approval.resolve_gateway_approval_by_prompt(platform="slack", chat_id="dm",
+        prompt_message_id="late-card", choice="once")
+    assert count == (0 if expired else 1)
+    assert not newer.event.is_set()
+    assert original.event.is_set() is (not expired)
+
+
+def test_cancelled_approval_send_cannot_bind(monkeypatch):
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+    entry = _ApprovalEntry({"request_id": "request"})
+    monkeypatch.setattr(approval, "_gateway_queues", {"session": [entry]})
+    monkeypatch.setattr(approval, "_gateway_prompt_index", {})
+    future = concurrent.futures.Future()
+    approval.bind_gateway_approval_when_sent(future, session_key="session", request_id="request",
+        platform="slack", chat_id="dm")
+    future.cancel()
+    assert approval._gateway_prompt_index == {} and not entry.event.is_set()

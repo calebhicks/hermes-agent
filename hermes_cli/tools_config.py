@@ -84,6 +84,7 @@ CONFIGURABLE_TOOLSETS = [
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("connections",     "🔌 Connections",               "remote connector tools and account authorization"),
+    ("goals",           "🎯 Standing Goals",            "current-session status/create/pause/resume/clear"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
@@ -107,7 +108,7 @@ def gui_toolset_label(label: str) -> str:
 # OFF by default for new installs (still in _HERMES_CORE_TOOLS; the checklist won't pre-select them). x_search
 # auto-enables when xAI creds exist; its check_fn still gates the schema. ``spotify`` and ``a2a`` are plugin
 # toolsets (catalog / bundled plugin) that stay opt-in once installed.
-_DEFAULT_OFF_TOOLSETS = {"spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban"}
+_DEFAULT_OFF_TOOLSETS = {"spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban", "goals"}
 
 # Config-only capabilities: provider setup in `hermes tools` (TOOL_CATEGORIES) but not model toolsets — zero
 # schemas, own switch (``stt.enabled``), never in ``platform_toolsets`` or the per-platform checklist.
@@ -691,17 +692,33 @@ def _recover_platform_native_toolsets(enabled_toolsets: set[str], platform: str,
             claimed.update(ts_tools)
 
 
+def _mcp_explicit_toolsets_only(config: dict) -> bool:
+    """Shared CLI/gateway/cron policy; malformed managed scope never means defaults."""
+    mcp_config = config.get("mcp") or {}
+    if not isinstance(mcp_config, dict):
+        raise ValueError("mcp must be a mapping")
+    explicit_only = mcp_config.get("explicit_toolsets_only", False)
+    if type(explicit_only) is not bool:
+        raise ValueError("mcp.explicit_toolsets_only must be a boolean")
+    return explicit_only
+
+
 def _merge_mcp_servers(
     config: dict, toolset_names: list[str], explicit_passthrough: set[str], include_default_mcp_servers: bool
 ) -> set[str]:
     """Explicit passthrough entries plus this platform's MCP servers: listed names form an allowlist, else every
     globally enabled server (when ``include_default_mcp_servers``); the ``no_mcp`` sentinel disables all."""
+    explicit_only = _mcp_explicit_toolsets_only(config)
     enabled_mcp_servers = enabled_mcp_server_names(config)
     result = explicit_passthrough - enabled_mcp_servers
     if "no_mcp" in toolset_names:
         return result - {"no_mcp"}
     explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
-    if include_default_mcp_servers and not explicit_mcp_servers:
+    # Managed profiles can disable the fallback independently of no_mcp, which
+    # the CLI/WebUI tool picker deliberately removes on save. Explicit MCP
+    # names still work; losing a sentinel or every named server never widens
+    # that profile to the global server union.
+    if include_default_mcp_servers and not explicit_mcp_servers and not explicit_only:
         return result | enabled_mcp_servers
     return result | explicit_mcp_servers
 

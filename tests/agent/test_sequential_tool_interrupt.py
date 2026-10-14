@@ -127,3 +127,38 @@ def test_interrupt_prefers_real_result_from_cooperative_tool(
 
     assert managed.result == "real result"
     assert not isinstance(managed.result, _ToolCancelledResult)
+
+
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    ["clarify", "mcp__conductor_caleb_relay__ask_caleb"],
+)
+def test_never_parallel_tools_stay_inline(monkeypatch, fake_agent, function_name):
+    """Human-wait tools keep the inline path and own their own deadlines."""
+
+    seen_thread = []
+
+    def _fake_middleware(agent_arg, **kwargs):
+        seen_thread.append(threading.current_thread().ident)
+        return _ManagedToolResult(
+            result="ok", args={}, middleware_trace=[],
+            blocked=False, dispatched=True,
+        )
+
+    monkeypatch.setattr(
+        tool_executor, "_run_agent_tool_execution_middleware", _fake_middleware
+    )
+
+    managed = _run_sequential_tool_execution_middleware(
+        fake_agent,
+        function_name=function_name,
+        function_args={},
+        effective_task_id="t",
+        tool_call_id="call_4",
+        execute=lambda a: "unused",
+    )
+
+    assert managed.result == "ok"
+    assert seen_thread and seen_thread[0] == threading.current_thread().ident

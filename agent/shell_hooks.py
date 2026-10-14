@@ -478,6 +478,8 @@ def _parse_pre_tool_call(data: dict[str, Any]) -> Optional[dict[str, Any]]:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 directive[key] = value.strip()
+        if data.get("always_prompt") is True:
+            directive["always_prompt"] = True
         return directive
     return None
 

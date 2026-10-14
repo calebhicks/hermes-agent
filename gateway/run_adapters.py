@@ -933,7 +933,7 @@ class GatewayAdapterLifecycleMixin:
             await build_channel_directory(self.adapters)
         # A platform offline at startup skipped its restart-interrupted sessions; resume them now.
         try:
-            self._schedule_resume_pending_sessions(platform=platform)
+            await self._schedule_resume_pending_sessions(platform=platform)
         except Exception:
             logger.debug("resume-pending reschedule after %s reconnect failed", platform.value, exc_info=True)
 
@@ -1488,7 +1488,7 @@ class GatewayAdapterLifecycleMixin:
                             # channels, and sessions boot skipped for this offline adapter wait for this call.
                             self._schedule_planned_restart_replay()
                             try:
-                                self._schedule_resume_pending_sessions(platform=platform)
+                                await self._schedule_resume_pending_sessions(platform=platform)
                             except Exception:
                                 logger.debug("resume-pending reschedule after %s reconnect failed (profile: %s)",
                                              platform.value, profile_name, exc_info=True)
