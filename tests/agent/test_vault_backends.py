@@ -231,3 +231,27 @@ def test_onepassword_backend_env_forwards_config_directory(monkeypatch):
     backend = OnePasswordLoginBackend({"enabled": True})
 
     assert backend._env(None)["OP_CONFIG_DIR"] == "/tmp/op-config"
+
+
+def test_onepassword_service_account_get_passes_item_vault():
+    """Service-account `op item get` must name the vault or op refuses the read."""
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    backend = OnePasswordLoginBackend({"enabled": True})
+    backend._service_token = "sa-token"
+    listing = json.dumps([{"id": "other", "vault": {"id": "v0"}}, {"id": "abc", "vault": {"id": "v1"}}])
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        return listing if args[:2] == ("item", "list") else "pw\n"
+
+    with patch.object(backend, "_run", side_effect=fake_run):
+        assert backend.resolve_password("op:abc") == "pw"
+    assert calls[-1] == ("item", "get", "abc", "--vault", "v1", "--fields", "label=password", "--reveal")
+
+    backend._service_token = ""
+    calls.clear()
+    with patch.object(backend, "_run", side_effect=fake_run):
+        backend.resolve_password("op:abc")
+    assert calls == [("item", "get", "abc", "--fields", "label=password", "--reveal")]
