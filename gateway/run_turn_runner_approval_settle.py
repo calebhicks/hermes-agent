@@ -82,3 +82,44 @@ async def _edit_card(adapter, chat_id: str, message_id: str, content: str) -> bo
         logger.debug("Approval card edit failed; sending the notice as a new message", exc_info=True)
         return False
     return bool(getattr(result, "success", False))
+
+
+def finish_text_approval_send(runner, future, approval_data: dict, *, command: str) -> None:
+    """A failed prompt cannot create a human wait; an uncertain send is never retried."""
+    from gateway.run import _approval_send_result
+    from tools.approval import (
+        bind_gateway_approval_prompt, bind_gateway_approval_when_sent, withdraw_gateway_approval,
+    )
+
+    ctx = runner._ctx
+    binding = {
+        "session_key": ctx.session_key or "",
+        "request_id": approval_data.get("request_id", ""),
+        "platform": ctx.source.platform,
+        "chat_id": ctx._status_chat_id,
+    }
+    outcome, result = _approval_send_result(future, timeout=15)
+    if outcome == "ambiguous":
+        # The prompt may already be visible. Retain only this request's late
+        # acknowledgement binding; resending could create a second live prompt.
+        bind_gateway_approval_when_sent(future, **binding)
+
+        def settled(done):
+            late_outcome, _ = _approval_send_result(done, timeout=0)
+            if late_outcome == "sent":
+                register_timeout_notice(runner, approval_data, command=command, card_message_id=None)
+            elif late_outcome in {"failed", "declined"}:
+                withdraw_gateway_approval(
+                    binding["session_key"], binding["request_id"], "approval prompt was not delivered",
+                )
+
+        future.add_done_callback(settled)
+        return
+    if outcome != "sent":
+        # _await_gateway_decision removes the request when notify raises. A
+        # return here instead leaves an invisible wait for approvals.timeout.
+        raise RuntimeError("Approval prompt was not delivered; command was not authorized")
+    register_timeout_notice(runner, approval_data, command=command, card_message_id=None)
+    bind_gateway_approval_prompt(
+        **binding, prompt_message_id=getattr(result, "message_id", None),
+    )

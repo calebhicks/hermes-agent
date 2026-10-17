@@ -1565,26 +1565,13 @@ class TurnRunner:
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
         msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
-        try:
-            # Mark as approval prompt: WeCom routes it through the control lane and Telegram pushes it
-            # in "important" mode (#132516). Never ``notify`` — A2A reads that as the turn-final reply.
-            metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}
-            fut = self._schedule(
-                adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
-            )
-            if fut is not None:
-                text_result = fut.result(timeout=15)
-                if getattr(text_result, "success", False):
-                    register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
-                    bind_gateway_approval_prompt(
-                        session_key=ctx.session_key or "",
-                        request_id=approval_data.get("request_id", ""),
-                        platform=ctx.source.platform,
-                        chat_id=ctx._status_chat_id,
-                        prompt_message_id=getattr(text_result, "message_id", None),
-                    )
-        except Exception as e:
-            logger.error("Failed to send approval request: %s", e)
+        from gateway.run_turn_runner_approval_settle import finish_text_approval_send
+        metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}
+        fut = self._schedule(
+            adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)),
+            "Approval text-send scheduling error",
+        )
+        finish_text_approval_send(self, fut, approval_data, command=cmd)
 
     # ── run_sync phases ─────────────────────────────────────────────────────────────────────
 
